@@ -18,7 +18,7 @@ It also demonstrates the use of low‑level and undocumented platform internals 
 
 Quick load **NativeLib Console** From ISE or Terminal / powershell [As Admin]
 ````powershell
-iwr 'https://tinyurl.com/pkeyLoader' | iex
+iwr 'https://tinyurl.com/pkeyLoader2' | iex
 ````
 ---
 
