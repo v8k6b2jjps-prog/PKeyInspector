@@ -10710,7 +10710,7 @@ function Call-WebService {
     param (
         [int]$requestType,
         [string]$installationId,
-        [string]$extendedProductId
+        [string]$extendedProductId = '00000-00000-000-000000-00-00000-00000.0000-0000000'
     )
 
 function Parse-SoapResponse {
@@ -11334,7 +11334,7 @@ if ($ppwszInstallationIdPtr -ne [IntPtr]::Zero) {
 }
 
 #Write-Host
-#Call-WebService -requestType 1 -installationId $ppwszInstallation -extendedProductId $extPid
+#Call-WebService -requestType 1 -installationId $ppwszInstallation
 
 Write-Host
 Write-Host "** PidGenX2 Info" -ForegroundColor Green
@@ -11348,7 +11348,7 @@ Write-Host
 Get-PKeyData -key $PKey -configPath $PKeyConfig -AsObject
 
 #Write-Host
-#Call-WebService -requestType 1 -installationId $IID -extendedProductId $extPid
+#Call-WebService -requestType 1 -installationId $IID
 #>
 function Get-PidGenX {
     param (
@@ -11555,7 +11555,7 @@ function Get-PKeyData {
 
     # to receive the confirmation ID ........
     # you will have to have the extended product id too.
-    #Call-WebService -requestType 1 -installationId $ppwszInstallation -extendedProductId $extPid
+    #Call-WebService -requestType 1 -installationId $ppwszInstallation
 
     $results = @()
 
@@ -15311,8 +15311,8 @@ Function Invoke-OfflineActivation {
             }
             $pwszConfirmationId = Call-WebService `
                 -requestType 1 `
-                -installationId $InstallationId `
-                -extendedProductId $AdvancedPID
+                -installationId $InstallationId
+                #-extendedProductId $AdvancedPID
             if ($pwszConfirmationId.Length -ne 48) {
                 Write-Warning "Call-WebService Fail {$pProductSkuId}"
                 continue
