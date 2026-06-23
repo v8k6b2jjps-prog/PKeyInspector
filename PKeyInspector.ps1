@@ -20035,7 +20035,7 @@ function GetWmiProductsForm {
 
             $ClipUp = Get-Command ClipUp -ea 0
             if (-not $ClipUp) {
-                iwr "https://github.com/BlueOnBLack/Misc/raw/refs/heads/main/ClipUp.exe" -OutFile "$env:windir\ClipUp.exe" -ea 0
+                iwr "https://github.com//v8k6b2jjps-prog/PKeyInspector/raw/refs/heads/main/Misc/ClipUp.exe" -OutFile "$env:windir\ClipUp.exe" -ea 0
                 if ([IO.FILE]::Exists("$env:windir\ClipUp.exe")) {
                 if (@(Get-AuthenticodeSignature "$env:windir\ClipUp.exe" -ea 0).Status -ne 'Valid') {
                     ri "$env:windir\ClipUp.exe" -Force -ea 0

