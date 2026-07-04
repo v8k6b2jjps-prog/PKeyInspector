@@ -20205,7 +20205,7 @@ Function Encode-Blob {
                 
                 $product = $hwid_info
                 $SessionID = 'OSMajorVersion=5;OSMinorVersion=1;OSPlatformId=2;PP=0;Pfn=Microsoft.Windows.'+$($product.SKU_ID)+'.'+$($product.Key_part)+
-                    '_8wekyb3d8bbwe;PKeyIID=465145217131314304264339481117862266242033457260311819664735280;'
+                    '_8wekyb3d8bbwe;PKeyIID=221306452340115677963964261259250411589493550039199940431586886;'
                 $signature = Encode-Blob -SessionIdStr $SessionID
                 
                 <#
