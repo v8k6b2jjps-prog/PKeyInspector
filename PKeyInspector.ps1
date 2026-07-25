@@ -15329,6 +15329,116 @@ Function Invoke-OfflineActivation {
 }
 
 <#
+ * Get Confirmation ID (No-Login GM Version)
+ - https://github.com/wpyok168/cfgetcid
+ - https://github.com/wpyok168/GetCID_GH
+ - https://greasyfork.org/en/scripts/575834-%E8%8E%B7%E5%8F%96%E7%A1%AE%E8%AE%A4id%E5%85%8D%E7%99%BB%E5%BD%95gm%E7%89%88/code
+
+ * lightweight, modern mini-version of VAMT's proxy activation feature
+ - https://github.com/dadorner-msft/activationws
+#>
+function Resolve-ConfirmationId {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]$InstallationId,
+
+        [ValidateSet("VisualSupport", "BatchActivation")]
+        [string]$Endpoint = "VisualSupport",
+
+        [string]$ProductGroup = "Windows",
+        [string]$ProductName = "Windows 11",
+        [string]$Country = "CHN",
+        [string]$Region = "APGC"
+    )
+
+    begin {
+        Add-Type -AssemblyName System.Net.Http
+        
+        # Backward-compatible singleton check for PowerShell 5.1
+        if (-not $global:HttpPool) {
+            $global:HttpPool = [System.Net.Http.HttpClient]::new()
+        }
+
+        function ConvertTo-Base64Url {
+            param([byte[]]$Bytes)
+            if (-not $Bytes) { return "" }
+            [Convert]::ToBase64String($Bytes).Split('=')[0].Replace('+', '-').Replace('/', '_')
+        }
+    }
+
+    process {
+        $cleanedIid = [regex]::Replace($InstallationId, '[^0-9]', '')
+        if (-not $cleanedIid) { throw "Invalid Installation ID." }
+
+        $InvokeVisualSupportCall = {
+            param([string]$Iid)
+            $token  = Invoke-RestMethod "https://cidtoken.x2ray.cfd" -TimeoutSec 10
+            $govUrl = Invoke-RestMethod "https://visualsupport.microsoft.com/api/configuration/govUrlID"
+
+            $ecdsa = [System.Security.Cryptography.ECDsa]::Create()
+            if ($ecdsa.GetType().Name -eq "ECDsaCng") { $ecdsa.KeySize = 256 }
+            else { $ecdsa = [System.Security.Cryptography.ECDsa]::Create([System.Security.Cryptography.ECCurve]::NamedCurves.nistP256) }
+            
+            $p = $ecdsa.ExportParameters($true)
+            $jwk = @{ kty = "EC"; crv = "P-256"; x = (ConvertTo-Base64Url $p.Q.X); y = (ConvertTo-Base64Url $p.Q.Y) }
+            
+            $headerJson = @{ alg = "ES256"; typ = "dpop+jwt"; jwk = $jwk } | ConvertTo-Json -Compress
+            $claimsJson = @{ htu = "/api/productActivation/validateIID"; htm = "POST"; jti = [Guid]::NewGuid(); iat = [Math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) } | ConvertTo-Json -Compress
+            
+            $jwtUnsigned = "$(ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes($headerJson))).$(ConvertTo-Base64Url ([Text.Encoding]::UTF8.GetBytes($claimsJson)))"
+            $sig = ConvertTo-Base64Url $ecdsa.SignData([Text.Encoding]::UTF8.GetBytes($jwtUnsigned), [Security.Cryptography.HashAlgorithmName]::SHA256)
+            
+            $payload = @{
+                IID = $Iid; ProductType = "windows"; productGroup = $ProductGroup; productName = $ProductName
+                numberOfDigits = [Math]::Floor($Iid.Length / 9); Country = $Country; Region = $Region
+                InstalledDevices = 1; OverrideStatusCode = "MUL"; InitialReasonCode = "45164"
+            } | ConvertTo-Json
+
+            $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "https://visualsupport.microsoft.com/api/productActivation/validateIID")
+            $request.Content = [System.Net.Http.StringContent]::new($payload, [Text.Encoding]::UTF8, "application/json")
+            $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::Parse("Bearer $($token.id_token)")
+            $request.Headers.Add("dpop", "$jwtUnsigned.$sig")
+            $request.Headers.Add("x-session-id", "app_$([Guid]::NewGuid().ToString("N").Substring(0,10))")
+            $request.Headers.Referrer = [System.Uri]"https://visualsupport.microsoft.com/$govUrl/activate"
+
+            $response = $global:HttpPool.SendAsync($request).GetAwaiter().GetResult()
+            $jsonResult = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            
+            if (-not $response.IsSuccessStatusCode) { throw "VisualSupport failed: $jsonResult" }
+            return ($jsonResult | ConvertFrom-Json).cid
+        }
+
+        $InvokeBatchActivationCall = {
+            param([string]$Iid)
+            $xml = "<ActivationRequest xmlns=`"http://www.microsoft.com/DRM/SL/BatchActivationRequest/1.0`"><VersionNumber>2.0</VersionNumber><RequestType>1</RequestType><Requests><Request><PID>00000-00000-000-000000-00-00000-00000.0000-0000000</PID><IID>$Iid</IID></Request></Requests></ActivationRequest>"
+            $bytes = [Text.Encoding]::Unicode.GetBytes($xml)
+            
+            $hmac = [Security.Cryptography.HMACSHA256]::new()
+            $hmac.Key = [byte[]]@(254,49,152,117,251,72,132,134,156,243,241,206,153,168,144,100,171,87,31,202,71,4,80,88,48,36,226,20,98,135,121,160+('0'*28))
+
+            $soap = "<soap:Envelope xmlns:soap=`"http://schemas.xmlsoap.org/soap/envelope/`"><soap:Body><BatchActivate xmlns=`"http://www.microsoft.com/BatchActivationService`"><request><Digest>$([Convert]::ToBase64String($hmac.ComputeHash($bytes)))</Digest><RequestXml>$([Convert]::ToBase64String($bytes))</RequestXml></request></BatchActivate></soap:Body></soap:Envelope>"
+
+            $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "https://activation.sls.microsoft.com/BatchActivation/BatchActivation.asmx")
+            $request.Content = [System.Net.Http.StringContent]::new($soap, [Text.Encoding]::UTF8, "text/xml")
+            $request.Headers.Add("SOAPAction", "http://www.microsoft.com/BatchActivationService/BatchActivate")
+
+            $response = $global:HttpPool.SendAsync($request).GetAwaiter().GetResult()
+            $respXml = [Net.WebUtility]::HtmlDecode($response.Content.ReadAsStringAsync().GetAwaiter().GetResult())
+
+            if ($respXml -match "<ErrorCode>(.*?)</ErrorCode>") { throw "Server Error: $($matches[1])" }
+            if ($respXml -match "<CID>(.*?)</CID>") { return $matches[1] }
+            throw "Failed to extract CID from response."
+        }
+
+        switch ($Endpoint) {
+            "VisualSupport"   { return &$InvokeVisualSupportCall   -Iid $cleanedIid }
+            "BatchActivation" { return &$InvokeBatchActivationCall -Iid $cleanedIid }
+        }
+    }
+}
+
+<#
 .SYNOPSIS
    WMI -> RefreshLicenseStatus
 #>
