@@ -15373,7 +15373,20 @@ function Resolve-ConfirmationId {
 
         $InvokeVisualSupportCall = {
             param([string]$Iid)
-            $token  = Invoke-RestMethod "https://cidtoken.x2ray.cfd" -TimeoutSec 10
+            $token = $Null
+            try {
+                $token = Invoke-RestMethod "https://cidtoken.x2ray.cfd" -TimeoutSec 10
+                $id_token = $token.id_token
+            } catch {}
+            if (-not $token) {
+                try {
+                    $token = Invoke-RestMethod "https://cidtoken.ntriver.org/token.json" -TimeoutSec 10
+                    $id_token = $token.token
+                } catch {}
+            }
+            if (-not $token) {
+                throw "Fail to get Token"
+            }
             $govUrl = Invoke-RestMethod "https://visualsupport.microsoft.com/api/configuration/govUrlID"
 
             $ecdsa = [System.Security.Cryptography.ECDsa]::Create()
@@ -15397,7 +15410,7 @@ function Resolve-ConfirmationId {
 
             $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "https://visualsupport.microsoft.com/api/productActivation/validateIID")
             $request.Content = [System.Net.Http.StringContent]::new($payload, [Text.Encoding]::UTF8, "application/json")
-            $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::Parse("Bearer $($token.id_token)")
+            $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::Parse("Bearer $id_token")
             $request.Headers.Add("dpop", "$jwtUnsigned.$sig")
             $request.Headers.Add("x-session-id", "app_$([Guid]::NewGuid().ToString("N").Substring(0,10))")
             $request.Headers.Referrer = [System.Uri]"https://visualsupport.microsoft.com/$govUrl/activate"
@@ -15405,7 +15418,9 @@ function Resolve-ConfirmationId {
             $response = $global:HttpPool.SendAsync($request).GetAwaiter().GetResult()
             $jsonResult = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
             
-            if (-not $response.IsSuccessStatusCode) { throw "VisualSupport failed: $jsonResult" }
+            if (-not $response.IsSuccessStatusCode) { 
+                throw "VisualSupport failed: $jsonResult" 
+            }
             return ($jsonResult | ConvertFrom-Json).cid
         }
 
