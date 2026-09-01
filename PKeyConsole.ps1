@@ -16311,6 +16311,7 @@ write-host "5. Office License Installer" -ForegroundColor Green
 write-host "6. Office Online Installation" -ForegroundColor Green
 write-host "7. Upgrade Windows edition" -ForegroundColor Green
 write-host "8. Recover Windows & Office License" -ForegroundColor Green
+Write-Host "9. Resolve Confirmation ID" -ForegroundColor Green
 Write-Host
 $choice = Read-Host "Please choose an option:"
 Write-Host
@@ -16346,7 +16347,85 @@ switch ($choice) {
         write-host "Recover Office License" -ForegroundColor Green
         write-host
         Get-SppStoreLicense -SkuType Office
-    }    
+    }
+    "9" {
+        do {
+            Clear-Host
+            Write-Host
+            Write-Host "Local Installation IDs & Confirmation ID Resolver" -ForegroundColor Green
+            Write-Host "--------------------------------------------------" -ForegroundColor DarkGray
+
+            if (-not $Global:OFFLINE) {
+                $m = [AppDomain]::CurrentDomain.DefineDynamicAssembly("null", 1).DefineDynamicModule("OFFLINE", $False).DefineType("null")
+                $m.DefinePInvokeMethod('SLGenerateOfflineInstallationIdEx', 'sppc.dll', 22, 1, [Int32], @([IntPtr], [Guid].MakeByRefType(), [Int32], [IntPtr].MakeByRefType()), 1, 3).SetImplementationFlags(128)
+                $Global:OFFLINE = $m.CreateType()
+            }
+
+            foreach ($skuType in @("Windows", "Office")) {
+                Write-Host "`n--- Scanning $skuType Licenses ---" -ForegroundColor Cyan
+                $sppData = Get-SppStoreLicense -SkuType $skuType -IgnoreEsu
+                
+                if (-not $sppData) {
+                    Write-Host "No valid $skuType licenses found." -ForegroundColor DarkYellow
+                    continue
+                }
+
+                foreach ($obj in $sppData) {
+                    $skuId = [Guid]$obj.SkuId
+                    $hSLC = Manage-SLHandle
+                    $pwszIID = [IntPtr]::Zero
+                    
+                    if (($Global:OFFLINE::SLGenerateOfflineInstallationIdEx($hSLC, [ref]$skuId, 0, [ref]$pwszIID)) -eq 0) {
+                        $installationId = [Runtime.InteropServices.Marshal]::PtrToStringUni($pwszIID)
+                        Write-Host "[SKU ID]: $skuId" -ForegroundColor Yellow
+                        Write-Host "[Installation ID]: $installationId" -ForegroundColor Green
+                        Write-Host ""
+                    }
+                }
+            }
+
+            Write-Host "--------------------------------------------------" -ForegroundColor DarkGray
+            $iidInput = Read-Host "Paste an IID from above to get its CID, or press Enter to return"
+            
+            # If user presses Enter (empty) or types Q, exit back to main menu
+            if ([string]::IsNullOrWhiteSpace($iidInput) -or $iidInput -eq 'Q' -or $iidInput -eq 'q') {
+                break
+            }
+
+            # Remove any hyphens or spaces to normalize the string
+            $cleanIid = $iidInput -replace '[^\d]', ''
+
+            if ($cleanIid.Length -in 63..64) {
+                Write-Host "`nAttempting resolution via BatchActivation..." -ForegroundColor Cyan
+                try {
+                    Resolve-ConfirmationId -InstallationId $cleanIid -Endpoint BatchActivation -ErrorAction Stop
+                }
+                catch {
+                    Write-Host "BatchActivation failed ($($_)). Trying VisualSupport..." -ForegroundColor Yellow
+                    try {
+                        $Results = Resolve-ConfirmationId -InstallationId $cleanIid -Endpoint VisualSupport -ErrorAction Stop
+                        if (-not [String]::IsNullOrEmpty($Results)) {
+                            Write-Host "`n[Success] Confirmation ID (VisualSupport):" -ForegroundColor Green
+                        }
+                        throw "end point failure"
+                    }
+                    catch {
+                        Write-Host "`n[Error] Both endpoints failed: $($_)" -ForegroundColor Red
+                    }
+                }
+            } 
+            else {
+                Write-Host "`n[Error] Invalid length ($($cleanIid.Length) digits). Must be 63-64 digits." -ForegroundColor Red
+            }
+            
+            Write-Host
+            $continueChoice = Read-Host "Press Enter to scan again, or 'Q' to return to the menu"
+            if ($continueChoice -eq 'Q' -or $continueChoice -eq 'q') {
+                break
+            }
+            
+        } while ($true)
+    }
 }
 # --> End
 }
