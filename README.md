@@ -83,6 +83,7 @@ Remove-Item -Path $tempFolder -Recurse -Force | Out-Null
 - Activation/license management (RESEARCH‑ONLY / GATED): integration points for lab/test workflows.
 - Check Products keys against the Official MS Server API, 2 Api for validate, 1 for activate
 - Export Windows & Office licenses include **product Keys** using tsforge Libary
+- Resolve Confirmation ID using Official API, Using Legacy Api + new Api
 - Extract HWID From Wmi->IID, Store->IID, Winrt Dll Call
 - Recover The CD-KEY using IID & Last 5 digits Only
 
