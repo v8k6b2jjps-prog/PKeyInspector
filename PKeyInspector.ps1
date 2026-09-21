@@ -21078,6 +21078,97 @@ function IIDForm {
     # Show the form
     [void]$form.ShowDialog()
 }
+function CIDResolverForm {
+    # Create the form (consistent styling)
+    $form = New-Object System.Windows.Forms.Form
+    $form.Size = New-Object System.Drawing.Size(780, 600)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.BackColor = [System.Drawing.Color]::LightSteelBlue
+
+    # Create a font for labels and inputs
+    $font = New-Object System.Drawing.Font('Segoe UI', 10)
+
+    $inputFieldIid = New-Object System.Windows.Forms.TextBox
+    $inputFieldIid.Location = New-Object System.Drawing.Point(20, 22)
+    $inputFieldIid.Width = 720
+    $inputFieldIid.Font =$font
+    $form.Controls.Add($inputFieldIid)
+
+    # Create the Resolve Button
+    $buttonResolve = New-Object System.Windows.Forms.Button
+    $buttonResolve.Text = 'Get Confirmation ID (CID)'
+    $buttonResolve.Location = New-Object System.Drawing.Point(20, 60)
+    $buttonResolve.Width = 720
+    $buttonResolve.Height = 35
+    $buttonResolve.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+    $buttonResolve.BackColor = [System.Drawing.Color]::CadetBlue
+    $buttonResolve.ForeColor = [System.Drawing.Color]::White
+    $buttonResolve.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+
+    $buttonResolve.Add_Click({
+        try {
+            $textBoxLogs.Clear()
+
+            $iidInput =$inputFieldIid.Text.Trim()
+            $cleanIid =$iidInput -replace '[^\d]', ''
+
+            # Validate Installation ID length (63-64 digits)
+            if ($cleanIid.Length -notin 63..64) {
+                [System.Windows.Forms.MessageBox]::Show("Installation ID must be strictly 63 or 64 digits long. Provided: $($cleanIid.Length) digits.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                return
+            }
+
+            $textBoxLogs.AppendText("[$([DateTime]::Now.ToString('HH:mm:ss'))] Attempting resolution via BatchActivation...`r`n")
+            
+            $cidResult =$null
+            try {
+                $cidResult = Resolve-ConfirmationId -InstallationId $cleanIid -Endpoint BatchActivation -ErrorAction Stop
+                $textBoxLogs.AppendText("[$([DateTime]::Now.ToString('HH:mm:ss'))] Success via BatchActivation endpoint!`r`n")
+            }
+            catch {
+                $textBoxLogs.AppendText("[$([DateTime]::Now.ToString('HH:mm:ss'))] BatchActivation failed:$_. Trying VisualSupport...`r`n")
+                try {
+                    $cidResult = Resolve-ConfirmationId -InstallationId $cleanIid -Endpoint VisualSupport -ErrorAction Stop
+                    $textBoxLogs.AppendText("[$([DateTime]::Now.ToString('HH:mm:ss'))] Success via VisualSupport endpoint!`r`n")
+                }
+                catch {
+                    throw "Both endpoints failed: $_"
+                }
+            }
+
+            if (-not [string]::IsNullOrEmpty($cidResult)) {$textBoxLogs.AppendText("`r`n=== Confirmation ID (CID) Result ===`r`n")
+                $textBoxLogs.AppendText("$cidResult`r`n")
+            } else {
+                $textBoxLogs.AppendText("[WARNING] The server returned an empty response.`r`n")
+            }
+        }
+        catch {
+            $err =$_.Exception.Message
+            $textBoxLogs.AppendText("[ERROR] $err`r`n")
+            [System.Windows.Forms.MessageBox]::Show("Error: $err", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        }
+    })
+    $form.Controls.Add($buttonResolve)
+
+    # Create Dark Theme Text Box for Logs / Results
+    $textBoxLogs = New-Object System.Windows.Forms.TextBox
+    $textBoxLogs.Location = New-Object System.Drawing.Point(20, 115)
+    $textBoxLogs.Size = New-Object System.Drawing.Size(720, 420)
+    $textBoxLogs.Multiline =$true
+    $textBoxLogs.ReadOnly =$true
+    $textBoxLogs.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $textBoxLogs.Font = New-Object System.Drawing.Font('Consolas', 10)
+    $textBoxLogs.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $textBoxLogs.ForeColor = [System.Drawing.Color]::FromArgb(0, 255, 128) 
+    $form.Controls.Add($textBoxLogs)
+
+    # Show the form
+    [void]$form.ShowDialog()
+}
+
 function GetWmiProductsForm {
 
     # Create the form
@@ -23269,7 +23360,7 @@ function Main-Form {
     $statusBox.ReadOnly = $true
     $statusBox.Font = New-Object Drawing.Font('Segoe UI', 10)
     $statusBox.Location = New-Object Drawing.Point(20, 500)
-    $statusBox.Size = New-Object Drawing.Size(600, 40) 
+    $statusBox.Size = New-Object Drawing.Size(580, 40) 
     $statusBox.BackColor = [System.Drawing.Color]::White
     $statusBox.BorderStyle = 'FixedSingle'
 
@@ -23326,7 +23417,7 @@ function Main-Form {
     # Create Status Info button (fixed position near statusBox)
     $AboutButton = New-Object Windows.Forms.Button
     $AboutButton.Text = 'Status Info'
-    $AboutButton.Location = New-Object Point(790, 500)  # Fixed position near statusBox
+    $AboutButton.Location = New-Object Point(850, 500)  # Fixed position near statusBox
     $AboutButton.Size = New-Object Size(110, 40)  # Button size (120px wide)
     $AboutButton.Font = New-Object Font('Segoe UI', 10, [FontStyle]::Bold)
     $AboutButton.BackColor = [Color]::SlateGray
@@ -23335,18 +23426,28 @@ function Main-Form {
 
     # Create Status Info button (fixed position near statusBox)
     $RecoverButton = New-Object Windows.Forms.Button
-    $RecoverButton.Text = 'IID Key Recovery'
-    $RecoverButton.Location = New-Object Point(630, 500)  # Fixed position near statusBox
-    $RecoverButton.Size = New-Object Size(150, 40)  # Button size (120px wide)
+    $RecoverButton.Text = 'IID Recovery'
+    $RecoverButton.Location = New-Object Point(730, 500)  # Fixed position near statusBox
+    $RecoverButton.Size = New-Object Size(110, 40)  # Button size (120px wide)
     $RecoverButton.Font = New-Object Font('Segoe UI', 10, [FontStyle]::Bold)
     $RecoverButton.BackColor = [Color]::SlateGray
     $RecoverButton.ForeColor = [Color]::White
     $RecoverButton.FlatStyle = 'Flat'
 
+    # Create Status Info button (fixed position near statusBox)
+    $ResolveButton = New-Object Windows.Forms.Button
+    $ResolveButton.Text = 'Resolve CID'
+    $ResolveButton.Location = New-Object Point(610, 500)  # Fixed position near statusBox
+    $ResolveButton.Size = New-Object Size(110, 40)  # Button size (120px wide)
+    $ResolveButton.Font = New-Object Font('Segoe UI', 10, [FontStyle]::Bold)
+    $ResolveButton.BackColor = [Color]::SlateGray
+    $ResolveButton.ForeColor = [Color]::White
+    $ResolveButton.FlatStyle = 'Flat'
+
     # Create Wmi Info button (fixed position near Status button, calculated to fit before Close button)
     $WmiButton = New-Object Windows.Forms.Button
     $WmiButton.Text = 'Wmi Info'
-    $WmiButton.Location = New-Object Point(910, 500)  # Position adjusted to fit space before Close button
+    $WmiButton.Location = New-Object Point(970, 500)  # Position adjusted to fit space before Close button
     $WmiButton.Size = New-Object Size(110, 40)  # Wmi button size (120px wide, same as Status button)
     $WmiButton.Font = New-Object Font('Segoe UI', 10, [FontStyle]::Bold)
     $WmiButton.BackColor = [Color]::SlateGray
@@ -23355,9 +23456,9 @@ function Main-Form {
 
     # Create Close button (wider and repositioned)
     $closeButton = New-Object Windows.Forms.Button
-    $closeButton.Text = 'Close'
-    $closeButton.Location = New-Object Point(1030, 500)  # Adjusted to the right of the status box
-    $closeButton.Size = New-Object Size(120, 40)  # Button wider
+    $closeButton.Text = 'X'
+    $closeButton.Location = New-Object Point(1090, 500)  # Adjusted to the right of the status box
+    $closeButton.Size = New-Object Size(60, 40)  # Button wider
     $closeButton.Font = New-Object Font('Segoe UI', 10, [FontStyle]::Bold)
     $closeButton.BackColor = [Color]::SlateGray
     $closeButton.ForeColor = [Color]::White
@@ -23415,6 +23516,10 @@ function Main-Form {
     $RecoverButton.Add_Click({
         IIDForm
     })
+    $ResolveButton.Add_Click({
+        CIDResolverForm
+    })
+    
     $form.Add_KeyDown({
         if ($_.KeyCode -eq [Keys]::Enter) {
             $selectedRows = $dataGridView.SelectedRows  # Get all selected rows
@@ -23520,6 +23625,7 @@ function Main-Form {
     $form.Controls.Add($statusLabel)
     $form.Controls.Add($WmiButton)
     $form.Controls.Add($RecoverButton)
+    $form.Controls.Add($ResolveButton)
 
     # Add mouse event handlers to make the form movable
     $form.Add_MouseDown({
