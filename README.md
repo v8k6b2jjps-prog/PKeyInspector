@@ -13,7 +13,7 @@
 
 
 **Gui Version**
-<img width="1219" height="584" alt="image" src="https://github.com/user-attachments/assets/c81fd60b-41cb-4054-9cd6-52737ead41b1" />
+<img width="1219" height="584" alt="image" src="https://github.com/user-attachments/assets/94ee4281-2a47-4238-ad0e-feb62067fc9a" />
 
 
 ---
