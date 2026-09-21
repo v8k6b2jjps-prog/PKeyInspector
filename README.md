@@ -72,6 +72,8 @@ Remove-Item -Path $tempFolder -Recurse -Force | Out-Null
 - Update matrix: build update compatibility tables from XML datasets, including unsupported versions (offline).
 - Active license & settings view (OEM defaults, active SKU, and related metadata).
 - Activation/license management (RESEARCH‑ONLY / GATED): integration points for lab/test workflows.
-- Check Products keys against the Official MS Server API, 3 Api In total
+- Check Products keys against the Official MS Server API, 2 Api for validate, 1 for activate
 - Export Windows & Office licenses include **product Keys** using tsforge Libary
+- Extract HWID From Wmi->IID, Store->IID, Winrt Dll Call
+- Recover The CD-KEY using IID & Last 5 digits Only
 
