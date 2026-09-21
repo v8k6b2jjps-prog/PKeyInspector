@@ -365,6 +365,871 @@ serverturbine,PRODUCT_DATACENTER_SERVER_AZURE_EDITION,0x00000197
 serverturbinecor,PRODUCT_DATACENTER_SERVER_CORE_AZURE_EDITION,0x00000198
 unliccensed,PRODUCT_UNLICENSED,0xABCDABCD
 '@ | ConvertFrom-Csv
+
+#region RVA
+# RVA From File->Offset
+function Resolve-AddressFromOffset {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [long]$Offset
+    )
+
+    if (-not (Test-Path $FilePath)) {
+        throw "File not found at: $FilePath"
+    }
+
+    [byte[]]$Bytes = [System.IO.File]::ReadAllBytes($FilePath)
+
+    # 1. Locate PE Header
+    $pePos = [BitConverter]::ToUInt32($Bytes, 0x3C)
+    $optHeaderPos = $pePos + 0x18
+    $magic = [BitConverter]::ToUInt16($Bytes, $optHeaderPos)
+
+    # Resolve ImageBase dynamically based on PE32 (0x010B) or PE32+ (0x020B)
+    if ($magic -eq 0x020B) {
+        # 64-bit PE32+ (ImageBase is at offset 24, 8 bytes)
+        $imageBase = [BitConverter]::ToUInt64($Bytes, $optHeaderPos + 24)
+    } elseif ($magic -eq 0x010B) {
+        # 32-bit PE32 (ImageBase is at offset 28, 4 bytes)
+        $imageBase = [BitConverter]::ToUInt32($Bytes, $optHeaderPos + 28)
+    } else {
+        throw "Unknown PE Optional Header Magic: $magic"
+    }
+    
+    # 2. Extract Section Metadata
+    $nSections = [BitConverter]::ToUInt16($Bytes, $pePos + 0x06)
+    $optHeaderSize = [BitConverter]::ToUInt16($Bytes, $pePos + 0x14)
+    $sectionTable = $pePos + 0x18 + $optHeaderSize
+
+    # 3. Iterate Sections to find where the FileOffset lives
+    for ($i = 0; $i -lt $nSections; $i++) {
+        $ptr = $sectionTable + ($i * 40)
+        
+        $rawPtr   = [BitConverter]::ToUInt32($Bytes, $ptr + 0x14)
+        $rawSize  = [BitConverter]::ToUInt32($Bytes, $ptr + 0x10)
+        $virtAddr = [BitConverter]::ToUInt32($Bytes, $ptr + 0x0C)
+        
+        # Read section name (8 bytes)
+        $secNameBytes = $Bytes[$ptr..($ptr + 7)]
+        $secName = [System.Text.Encoding]::ASCII.GetString($secNameBytes).Trim([char]0)
+
+        # Check if the offset falls within this section's raw data
+        if ($Offset -ge $rawPtr -and $Offset -lt ($rawPtr + $rawSize)) {
+            $rva = [Int64](($Offset - $rawPtr) + $virtAddr)
+            $fullAddress = [Int64]($imageBase + $rva)
+
+            return [PSCustomObject]@{
+                FilePath    = $FilePath
+                FileOffset  = $Offset
+                RVA         = $rva
+                ImageBase   = [Int64]$imageBase
+                FullAddress = $fullAddress
+                Section     = $secName
+            }
+        }
+    }
+    return $null
+}
+# RVA From PDB Export
+function Resolve-SymbolFromPdb {
+    param (
+        [string]$BinaryPath = "C:\Windows\System32\ntoskrnl.exe",
+        [string]$FunctionName = "MiAllocateVirtualMemory",
+        [string]$DownloadFolder = "C:\Symbols"
+    )
+
+    # 1. Pure Type Generation Reflection
+    try {
+        $Module = [AppDomain]::CurrentDomain.GetAssemblies() | ? { $_.ManifestModule.ScopeName -eq "PdbRaw" } | select -Last 1
+        $PdbRaw = $Module.GetTypes()[0]
+    }
+    catch {
+        $Module = [AppDomain]::CurrentDomain.DefineDynamicAssembly("null", 1).DefineDynamicModule("PdbRaw", $False).DefineType("null")
+        @(
+            @('SymInitialize',   'dbghelp.dll', [bool],   @([IntPtr], [string], [bool])),
+            @('SymCleanup',      'dbghelp.dll', [bool],   @([IntPtr])),
+            @('SymLoadModuleEx', 'dbghelp.dll', [uint64], @([IntPtr], [IntPtr], [string], [string], [uint64], [uint32], [IntPtr], [uint32])),
+            @('SymFromName',     'dbghelp.dll', [bool],   @([IntPtr], [string], [IntPtr]))
+        ) | % {
+            $Module.DefinePInvokeMethod(($_[0]), ($_[1]), 22, 1, [Type]($_[2]), [Type[]]($_[3]), 1, 3).SetImplementationFlags(128)
+        }
+        $PdbRaw = $Module.CreateType()
+    }
+
+    $index = -1
+    $found = $false
+    $bytes = [System.IO.File]::ReadAllBytes($BinaryPath)
+    $ms    = [System.IO.MemoryStream]::new($bytes)
+    $br    = [System.IO.BinaryReader]::new($ms)
+
+    while(($index = [Array]::IndexOf($bytes, [byte]0x52, $index + 1)) -ge 0)
+    {
+        # Verify "RSDS"
+        if(
+            $index + 24 -gt $bytes.Length -or
+            $bytes[$index + 1] -ne 0x53 -or
+            $bytes[$index + 2] -ne 0x44 -or
+            $bytes[$index + 3] -ne 0x53
+        ){
+            continue
+        }
+
+        # Read candidate RSDS record
+        $ms.Position = $index + 4      # Skip "RSDS"
+        $guid = (New-Object Guid (,$br.ReadBytes(16))).ToString("N").ToUpper()
+        $age  = $br.ReadUInt32()
+        $sb = [System.Text.StringBuilder]::new()
+
+        while($ms.Position -lt $ms.Length)
+        {
+            $b = $br.ReadByte()
+            if($b -eq 0){ break }
+            [void]$sb.Append([char]$b)
+        }
+
+        $name = Split-Path $sb.ToString() -Leaf
+
+        if(
+            $age -gt 0 -and
+            $name.Length -gt 4 -and
+            $name.Length -lt 260 -and
+            $name -cmatch '^[ -~]+\.pdb$'
+        ){
+            $pdbName = $name
+            $found = $true
+            break
+        }
+    }
+
+    $br.Close()
+    $ms.Close()
+
+    if(-not $found){
+        throw "Valid RSDS record not found."
+    }
+
+    # 3. Handle local cache check or download
+    $destination = Join-Path $DownloadFolder "$pdbName\$guid$age\$pdbName"
+    if (-not (Test-Path $destination)) {
+        Write-warning "PDB missing locally. Downloading..."
+        New-Item -ItemType Directory -Path (Split-Path $destination) -Force | Out-Null
+        $url = "https://msdl.microsoft.com/download/symbols/$pdbName/$guid$age/$pdbName"
+        Invoke-WebRequest -Uri $url -OutFile $destination -UserAgent "Microsoft-Symbol-Server/10.0.0.0"
+    }
+
+    # 4. Invoke PInvoke APIs via PdbRaw Methods
+    # FIX: Use the current process handle instead of a random integer to guarantee initialization context
+    $hProcess = [System.Diagnostics.Process]::GetCurrentProcess().Handle
+    
+    $fs = [System.IO.File]::OpenRead($BinaryPath)
+    $br = New-Object System.IO.BinaryReader($fs)
+
+    # 1. Read DOS header offset (e_lfanew is at 0x3C)
+    $fs.Position = 0x3C
+    $e_lfanew = $br.ReadInt32()
+
+    # 2. Check the Magic to confirm architecture (at offset e_lfanew + 24)
+    $fs.Position = $e_lfanew + 24
+    $magic = $br.ReadUInt16()
+
+    # 3. Read the clean ImageBase
+    if ($magic -eq 0x20B) { 
+        # 64-bit (PE32+): ImageBase is a UInt64 at offset e_lfanew + 48
+        $fs.Position = $e_lfanew + 48
+        $dummyBase = $br.ReadUInt64()
+    } else { 
+        # 32-bit (PE32): ImageBase is a UInt32 at offset e_lfanew + 52
+        $fs.Position = $e_lfanew + 52
+        $dummyBase = [uint64]$br.ReadUInt32()
+    }
+
+    $br.Close()
+    $fs.Close()
+
+    # FIX: Ensure SymInitialize is passed true or the local target directory to register the module context properly
+    $PdbDir = Split-Path $destination
+    [void]$PdbRaw::SymInitialize($hProcess, $PdbDir, $false)
+    
+    # Load the module layout cleanly
+    $modBase = $PdbRaw::SymLoadModuleEx($hProcess, [IntPtr]::Zero, $destination, $null, $dummyBase, [uint32]0, [IntPtr]::Zero, [uint32]0)
+
+    if ($modBase -eq 0) {
+        [void]$PdbRaw::SymCleanup($hProcess)
+        throw "Failed to load module inside dbghelp. Ensure the PDB target matches your architecture."
+    }
+
+    # FIX: Standardized unmanaged allocation via native Marshal instead of custom commandlets
+    $BufferSize = 88 + 2000
+    $pSymbolInfo = New-IntPtr -Size $BufferSize -InitialValue 88
+    [Marshal]::WriteInt32($pSymbolInfo, 76, 2000)
+
+    # Run the symbol search
+    $matched = $PdbRaw::SymFromName($hProcess, $FunctionName, $pSymbolInfo)
+
+    if ($matched) {
+        $AbsoluteAddress = [Marshal]::ReadInt64($pSymbolInfo, 56) # Offset 56 = Address
+        $offset = [int64]($AbsoluteAddress - $dummyBase)
+        $result = $offset
+    } else {
+        $result = $null
+    }
+
+    # Cleanup memory and symbol paths
+    [Marshal]::FreeHGlobal($pSymbolInfo)
+    [void]$PdbRaw::SymCleanup($hProcess)
+
+    if ($null -ne $result) { return $result } else { throw "Function '$FunctionName' not found." }
+}
+# HwidGetCurrentEx `Export` Function
+function Get-HwidRVA {
+    param (
+        $dllpath = "$env:windir\system32\LicensingWinRT.dll",
+        $pattern = [byte[]](0x18, 0x01, 0x00, 0x00)
+    )
+
+    if (-not (Test-Path $dllpath)) { return $null }
+    $dllBytes = [System.IO.File]::ReadAllBytes($dllpath)
+
+    # --- STAGE 1: FIRST CMP FIND ---
+    $firstCmpOffset = -1
+    for ($i = 3; $i -lt ($dllBytes.Length - 4); $i++) {  # Start at index 3 to safely access -1, -2, and -3 offsets
+        if ($dllBytes[$i] -eq $pattern[0] -and $dllBytes[$i+1] -eq $pattern[1] -and $dllBytes[$i+2] -eq $pattern[2]) {
+            $isEaxCmp      = ($dllBytes[$i-1] -eq 0x3D)
+            $isStandardCmp = ($dllBytes[$i-2] -eq 0x81 -and $dllBytes[$i-1] -ge 0xF8 -and $dllBytes[$i-1] -le 0xFB)
+            $isRexCmp      = ($dllBytes[$i-3] -eq 0x41 -and $dllBytes[$i-2] -eq 0x81 -and $dllBytes[$i-1] -ge 0xF8 -and $dllBytes[$i-1] -le 0xFB)
+
+            if ($isEaxCmp -or $isStandardCmp -or $isRexCmp) {
+                $firstCmpOffset = $i
+                break
+            }
+        }
+    }
+    if ($firstCmpOffset -eq -1) { return "Fail: CMP 0x118 not found" }
+
+    # --- STAGE 2: SECOND 0x118 FIND (Alloc Size) ---
+    $allocConstantOffset = -1
+    for ($j = ($firstCmpOffset - 1); $j -gt 0; $j--) {  # Search backward from firstCmpOffset
+        if ($dllBytes[$j] -eq $pattern[0] -and $dllBytes[$j+1] -eq $pattern[1] -and $dllBytes[$j+2] -eq $pattern[2]) {
+            $allocConstantOffset = $j
+            break
+        }
+    }
+    if ($allocConstantOffset -eq -1) { return "Fail: Second 0x118 not found before CMP" }
+
+    # --- UNIVERSAL STAGE 3: Multi-Prologue Precision Scan ---
+    $funcStartOffset = -1
+    # 0x150 (336 bytes) is the "sweet spot" for distance from the 118h constant
+    $searchLimit = [Math]::Max(0, $allocConstantOffset - 0x150)
+
+    for ($k = $allocConstantOffset; $k -gt $searchLimit; $k--) {
+        # Signature A: IDA "Hot-Patch" (mov rax, rsp) -> 48 8B C4
+        $isHotPatch = ($dllBytes[$k] -eq 0x48 -and $dllBytes[$k+1] -eq 0x8B -and $dllBytes[$k+2] -eq 0xC4)
+
+        # Signature B: Standard Stack Alloc (sub rsp, XX) -> 48 83 EC
+        $isSubRsp   = ($dllBytes[$k] -eq 0x48 -and $dllBytes[$k+1] -eq 0x83 -and $dllBytes[$k+2] -eq 0xEC)
+
+        # Signature C: Standard Frame Pointer (push rbp; mov rbp, rsp) -> 55 48 89 E5 (or just 55)
+        $isPushRbp  = ($dllBytes[$k] -eq 0x55 -and $dllBytes[$k+1] -eq 0x48 -and $dllBytes[$k+2] -eq 0x89)
+
+        if ($isHotPatch -or $isSubRsp -or $isPushRbp) {
+            # --- UNIVERSAL VALIDATION ---
+            # Every true function start must be preceded by alignment/padding:
+            # CC (int3), 90 (nop), or C3 (previous function's return)
+            $prev = $dllBytes[$k-1]
+            if ($prev -eq 0xCC -or $prev -eq 0x90 -or $prev -eq 0xC3) {
+                $funcStartOffset = $k
+                break
+            }
+        }
+    }
+
+    if ($funcStartOffset -gt 0) {
+        $Info = Resolve-AddressFromOffset -FilePath $dllpath -Offset $funcStartOffset
+        return $Info.FullAddress
+    }
+    throw "Could not locate RVA"
+}
+#endregion
+#region HWID
+function Hwid-ConvertToLargeInt {
+        param ([byte[]]$Raw)
+
+        # State tracking: Use [int64] internally to prevent overflow during calculation
+        $S = [PSCustomObject]@{ P = 28; L = [int64]0; H = [int64]0; S = 0 }
+
+        $Pack = {
+            param([int]$idx, [int]$bits, [int]$shift, [int64]$mask, [bool]$isHigh, $sShift)
+        
+            $cnt = [BitConverter]::ToUInt16($Raw, $idx * 2)
+            if ($cnt -eq 0) { return }
+
+            $v4 = [BitConverter]::ToUInt16($Raw, $S.P)
+            for ($i=0; $i -lt $cnt; $i++) {
+                $val = [BitConverter]::ToUInt16($Raw, $S.P + ($i * 2))
+                if (($val -band 1) -eq 0) { $v4 = $val; break }
+            }
+            $S.S = ($v4 -band 1)
+        
+            $m = (1 -shl $bits) - 1
+            $hash = $m -band ($v4 -shr 1)
+            if ($hash -eq 0) { $hash = $m }
+
+            # Logic: Perform bitwise as Int64, then mask to 32-bit to mimic register overflow
+            if ($isHigh) {
+                $valToXor = ([int64]$hash -shl $shift)
+                $S.H = ($S.H -bxor (($S.H -bxor $valToXor) -band $mask)) -band 0xFFFFFFFF
+            } else {
+                $valToXor = ([int64]$hash -shl $shift)
+                $S.L = ($S.L -bxor (($S.L -bxor $valToXor) -band $mask)) -band 0xFFFFFFFF
+            }
+
+            if ($null -ne $sShift) {
+                $S.L = ($S.L -bxor (($S.L -bxor ($S.L -bor ($S.S -shl $sShift))) -band 0x7C0)) -band 0xFFFFFFFF
+            }
+
+            $S.P += (2 * $cnt)
+        }
+
+        # Header Logic
+        $v3 = [BitConverter]::ToUInt16($Raw, 26)
+        if ($v3) { 
+            $v6 = (($v3 -shr 1) -band 0x3F)
+            $S.L = if ($v6) { [int64]$v6 } else { [int64]63 }
+        }
+
+        $v8 = [BitConverter]::ToUInt16($Raw, 24)
+        if ($v8) { 
+            $v9 = (($v8 -shr 1) -band 7)
+            $v10 = if ($v9) { $v9 } else { 7 }
+            $S.H = ([int64]$v10 -shl 29) -band 0xFFFFFFFF
+        }
+
+        # Word 2-10 (Full Implementation)
+        &$Pack 2  7 21 0xFE00000    $false 6
+        &$Pack 3  4 28 0xF0000000   $false $null
+        &$Pack 4  7 9  0xFE00       $true  7
+        &$Pack 5  5 21 0x3E00000    $true  $null
+        &$Pack 6  5 16 0x1F0000     $true  8
+        &$Pack 7  6 3  0x1F8        $true  9
+    
+        $S.P += (2 * [BitConverter]::ToUInt16($Raw, 16)) 
+    
+        &$Pack 9  10 11 0x1FF800    $false 10
+        &$Pack 10 3  26 0x1C000000   $true  $null
+
+        # Merge High and Low into final 64-bit ID
+        $final = ([int64]$S.H -shl 32) -bor ([uint32]$S.L)
+        return $final
+    }
+function Get-SystemHardwareIdentifiers {
+    [CmdletBinding()]
+    param()
+
+    try {
+        $offlineIid    =$null
+        $extractedHwid =$null
+        $storeHwid     =$null
+        $winRtHwid     =$null
+
+        # 1. Extract WMI Offline Installation ID & Decoded HWID
+        $InstallationIdList = Get-CimInstance -Query "SELECT ID, OfflineInstallationId FROM SoftwareLicensingProduct WHERE PartialProductKey IS NOT NULL AND OfflineInstallationId IS NOT NULL" -ErrorAction SilentlyContinue
+        if ($InstallationIdList) {
+            $offlineIid =$InstallationIdList[0].OfflineInstallationId
+            $decodedParams = [Activator]::CreateInstance([Type]'DecodedParameters')
+            $readResult = [MSFT]::ReadParametersFromString($offlineIid, [ref]$decodedParams);
+            if ($readResult -eq 0) {
+                $extractedHwid =$decodedParams.hwid
+            }
+        }
+
+        # 2. Extract Store License HWID
+        $StoreObj = Get-SppStoreLicense -SkuType Windows -IgnoreEsu -Dump -ErrorAction SilentlyContinue | 
+            Where-Object Value -match 'current' | 
+            Select-Object -First 1
+        if ($StoreObj -and $StoreObj["raw"]) {
+            $storeHwid = Hwid-ConvertToLargeInt -Raw ($StoreObj["raw"])
+        }
+
+        # 3. Extract WinRT HWID via Unmanaged Code / PDB / Byte Pattern
+        $WinrtDll = Join-Path $env:windir "System32\LicensingWinRT.dll"
+        $sub = 0
+
+        if (Test-Path $WinrtDll) {
+            # Try using PDB Parser
+            if ($sub -le 0) {
+                try {
+                    $BASE = 0x180000000
+                    $RVA  = Resolve-SymbolFromPdb -BinaryPath $WinrtDll -FunctionName HwidGetCurrentEx
+                    $sub = ($BASE +$RVA)
+                } catch {}
+            }
+
+            # Try using Byte Pattern
+            if ($sub -le 0) {
+                try {
+                    $sub = Get-HwidRVA -dllpath$WinrtDll
+                } catch {}
+            }
+
+            if ($sub -gt 0) {
+                $params = 0L, 0x0, [ref]0L, [ref]0L, [ref]0L, [ref]0L
+                $hr = Invoke-UnmanagedMethod `
+                    -Dll $WinrtDll `
+                    -Function "Inner" `
+                    -Values $params `
+                    -Sub $sub
+
+                if ($hr -ge 0 -and $params[2].Value -ne 0L) {
+                    $byteArray = New-Object Byte[] 0x118
+                    [System.Runtime.InteropServices.Marshal]::Copy(([IntPtr]::Add($params[2].Value, 0)),$byteArray, 0, 0x118)
+                    $winRtHwid = Hwid-ConvertToLargeInt -Raw $byteArray
+                }
+            }
+        }
+
+        # Return a structured PSCustomObject
+        return [PSCustomObject]@{
+            ExtractedHwid         = $extractedHwid
+            StoreHwid             = $storeHwid
+            WinRtHwid             = $winRtHwid
+        }
+    }
+    catch {
+        Write-Error "Failed to retrieve hardware identifiers: $($_.Exception.Message)"
+        return $null
+    }
+}
+#endregion
+#region MSFT
+## MSFT ##
+<#
+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
+#>
+## END ##
+#endregion
+#region BinaryKey
+class BinaryKey {
+    
+    [uint16]$Group
+    [uint32]$Serial
+    [uint64]$Security
+    [bool]$IsNKey
+    [int32]$Checksum
+    [byte[]]$BinaryData
+    [string]$CdKey
+
+    BinaryKey([string]$ProductKey) {
+        $this.BinaryData = [BinaryKey]::EncodeBinaryKey($ProductKey)
+        $BinKeyInfo = [BinaryKey]::UnpackBinaryKey($this.BinaryData, $true)
+        $this.Group = $BinKeyInfo.Group
+        $this.Serial = $BinKeyInfo.Serial
+        $this.Security = $BinKeyInfo.Security
+        $this.IsNKey = $BinKeyInfo.IsNKey
+        $this.CdKey = $ProductKey
+        $this.Checksum = [BinaryKey]::GetKeyChecksum($this.BinaryData)
+    }
+    BinaryKey([byte[]]$BinaryData, [bool]$Stream = $true) {
+        $this.BinaryData = $BinaryData.Clone()
+        $BinKeyInfo = [BinaryKey]::UnpackBinaryKey($this.BinaryData, $true)
+        $this.Group = $BinKeyInfo.Group
+        $this.Serial = $BinKeyInfo.Serial
+        $this.Security = $BinKeyInfo.Security
+        $this.IsNKey = $BinKeyInfo.IsNKey
+        $this.CdKey = [BinaryKey]::DecodeBinaryKey($this.BinaryData)
+        $this.Checksum = [BinaryKey]::GetKeyChecksum($this.BinaryData)
+    }
+    BinaryKey([uint16]$Group, [uint32]$Serial, [uint64]$Security, [bool]$IsNKey = $true, [bool]$Stream = $true) {
+        $this.BinaryData = [BinaryKey]::FormatBinaryKey($Group, $Serial, $Security, $IsNKey, $Stream)
+        $this.Group = $Group
+        $this.Serial = $Serial
+        $this.Security = $Security
+        $this.IsNKey = $IsNKey
+        $this.CdKey = [BinaryKey]::DecodeBinaryKey($this.BinaryData)
+        $this.Checksum = [BinaryKey]::GetKeyChecksum($this.BinaryData)
+    }
+
+    # --- Static Key Checksum method ---
+    static $CrcTable = @(
+        0x00000000, 0x04C11DB7, 0x09823B6E, 0x0D4326D9, 0x130476DC, 0x17C56B6B, 0x1A864DB2, 0x1E475005,
+        0x2608EDB8, 0x22C9F00F, 0x2F8AD6D6, 0x2B4BCB61, 0x350C9B64, 0x31CD86D3, 0x3C8EA00A, 0x384FBDBD,
+        0x4C11DB70, 0x48D0C6C7, 0x4593E01E, 0x4152FDA9, 0x5F15ADAC, 0x5BD4B01B, 0x569796C2, 0x52568B75,
+        0x6A1936C8, 0x6ED82B7F, 0x639B0DA6, 0x675A1011, 0x791D4014, 0x7DDC5DA3, 0x709F7B7A, 0x745E66CD,
+        0x9823B6E0, 0x9CE2AB57, 0x91A18D8E, 0x95609039, 0x8B27C03C, 0x8FE6DD8B, 0x82A5FB52, 0x8664E6E5,
+        0xBE2B5B58, 0xBAEA46EF, 0xB7A96036, 0xB3687D81, 0xAD2F2D84, 0xA9EE3033, 0xA4AD16EA, 0xA06C0B5D,
+        0xD4326D90, 0xD0F37027, 0xDDB056FE, 0xD9714B49, 0xC7361B4C, 0xC3F706FB, 0xCEB42022, 0xCA753D95,
+        0xF23A8028, 0xF6FB9D9F, 0xFBB8BB46, 0xFF79A6F1, 0xE13EF6F4, 0xE5FFEB43, 0xE8BCCD9A, 0xEC7DD02D,
+        0x34867077, 0x30476DC0, 0x3D044B19, 0x39C556AE, 0x278206AB, 0x23431B1C, 0x2E003DC5, 0x2AC12072,
+        0x128E9DCF, 0x164F8078, 0x1B0CA6A1, 0x1FCDBB16, 0x018AEB13, 0x054BF6A4, 0x0808D07D, 0x0CC9CDCA,
+        0x7897AB07, 0x7C56B6B0, 0x71159069, 0x75D48DDE, 0x6B93DDDB, 0x6F52C06C, 0x6211E6B5, 0x66D0FB02,
+        0x5E9F46BF, 0x5A5E5B08, 0x571D7DD1, 0x53DC6066, 0x4D9B3063, 0x495A2DD4, 0x44190B0D, 0x40D816BA,
+        0xACA5C697, 0xA864DB20, 0xA527FDF9, 0xA1E6E04E, 0xBFA1B04B, 0xBB60ADFC, 0xB6238B25, 0xB2E29692,
+        0x8AAD2B2F, 0x8E6C3698, 0x832F1041, 0x87EE0DF6, 0x99A95DF3, 0x9D684044, 0x902B669D, 0x94EA7B2A,
+        0xE0B41DE7, 0xE4750050, 0xE9362689, 0xEDF73B3E, 0xF3B06B3B, 0xF771768C, 0xFA325055, 0xFEF34DE2,
+        0xC6BCF05F, 0xC27DEDE8, 0xCF3ECB31, 0xCBFFD686, 0xD5B88683, 0xD1799B34, 0xDC3ABDED, 0xD8FBA05A,
+        0x690CE0EE, 0x6DCDFD59, 0x608EDB80, 0x644FC637, 0x7A089632, 0x7EC98B85, 0x738AAD5C, 0x774BB0EB,
+        0x4F040D56, 0x4BC510E1, 0x46863638, 0x42472B8F, 0x5C007B8A, 0x58C1663D, 0x558240E4, 0x51435D53,
+        0x251D3B9E, 0x21DC2629, 0x2C9F00F0, 0x285E1D47, 0x36194D42, 0x32D850F5, 0x3F9B762C, 0x3B5A6B9B,
+        0x0315D626, 0x07D4CB91, 0x0A97ED48, 0x0E56F0FF, 0x1011A0FA, 0x14D0BD4D, 0x19939B94, 0x1D528623,
+        0xF12F560E, 0xF5EE4BB9, 0xF8AD6D60, 0xFC6C70D7, 0xE22B20D2, 0xE6EA3D65, 0xEBA91BBC, 0xEF68060B,
+        0xD727BBB6, 0xD3E6A601, 0xDEA580D8, 0xDA649D6F, 0xC423CD6A, 0xC0E2D0DD, 0xCDA1F604, 0xC960EBB3,
+        0xBD3E8D7E, 0xB9FF90C9, 0xB4BCB610, 0xB07DABA7, 0xAE3AFBA2, 0xAAFBE615, 0xA7B8C0CC, 0xA379DD7B,
+        0x9B3660C6, 0x9FF77D71, 0x92B45BA8, 0x9675461F, 0x8832161A, 0x8CF30BAD, 0x81B02D74, 0x857130C3,
+        0x5D8A9099, 0x594B8D2E, 0x5408ABF7, 0x50C9B640, 0x4E8EE645, 0x4A4FFBF2, 0x470CDD2B, 0x43CDC09C,
+        0x7B827D21, 0x7F436096, 0x7200464F, 0x76C15BF8, 0x68860BFD, 0x6C47164A, 0x61043093, 0x65C52D24,
+        0x119B4BE9, 0x155A565E, 0x18197087, 0x1CD86D30, 0x029F3D35, 0x065E2082, 0x0B1D065B, 0x0FDC1BEC,
+        0x3793A651, 0x3352BBE6, 0x3E119D3F, 0x3AD08088, 0x2497D08D, 0x2056CD3A, 0x2D15EBE3, 0x29D4F654,
+        0xC5A92679, 0xC1683BCE, 0xCC2B1D17, 0xC8EA00A0, 0xD6AD50A5, 0xD26C4D12, 0xDF2F6BCB, 0xDBEE767C,
+        0xE3A1CBC1, 0xE760D676, 0xEA23F0AF, 0xEEE2ED18, 0xF0A5BD1D, 0xF464A0AA, 0xF9278673, 0xFDE69BC4,
+        0x89B8FD09, 0x8D79E0BE, 0x803AC667, 0x84FBDBD0, 0x9ABC8BD5, 0x9E7D9662, 0x933EB0BB, 0x97FFAD0C,
+        0xAFB010B1, 0xAB710D06, 0xA6322BDF, 0xA2F33668, 0xBCB4666D, 0xB8757BDA, 0xB5365D03, 0xB1F740B4
+    )
+    static [int] GetKeyChecksum([byte[]]$Data) {
+
+        # Replicate the sanitization/manipulation seen in sub_180020A1C
+        # The code works on a copy (v35)
+        $v35 = $Data.Clone()
+
+        # ASM: v11 = HIWORD(_mm_srli_si128(v7, 8).m128i_u64[0]); (This is Byte 14)
+        $v11 = [int]$v35[14]
+    
+        # ASM: v14 = v11 ^ (v11 ^ (4 * ((v11 & 8) != 0))) & 8;
+        # This effectively isolates/toggles the NKey bit (Bit 3)
+        $isNKeySet = ($v11 -band 8) -ne 0
+        $v14 = $v11 -bxor (($v11 -bxor (4 * [int]$isNKeySet)) -band 8)
+
+        # ASM: v35.m128i_i16[6] = v12 & 0x7F; (Byte 12)
+        $v35[12] = [byte]($v35[12] -band 0x7F)
+
+        # ASM: v17 = v14 & 0xFE; v35.m128i_i8[14] = v17; (Byte 14)
+        $v17 = [byte]($v14 -band 0xFE)
+        $v35[14] = $v17
+
+        # Byte 13 is included in the CRC but is usually zeroed in the 'clean' version
+        # The ASM doesn't explicitly zero it in the v35 copy before the loop, 
+        # but the extractor implies it's a dedicated CRC byte.
+        $v35[13] = 0
+
+        # --- CRC-32 LOOP ---
+        $v20 = [uint32]"0xFFFFFFFF"
+        foreach ($b in $v35) {
+            $idx = ([int]$b -bxor [int]($v20 -shr 24)) -band 0xFF
+            $v20 = [uint32]((($v20 -shl 8) -bxor [BinaryKey]::CrcTable[$idx]) -band 0xFFFFFFFF)
+        }
+
+        # ASM: if ( v31 == (~(_WORD)v20 & 0x3FF) )
+        $FinalCRC = [int]((-bnot $v20) -band 0x3FF)
+    
+        return $FinalCRC
+    }
+
+    # Static method version of New-BinaryKey
+    static [byte[]] FormatBinaryKey(
+        [uint16]$Group,
+        [uint32]$Serial,
+        [uint64]$Security,
+        [bool]$IsNKey = $true,
+        [bool]$Stream = $true ) {
+
+        # Internal helper function for setting bits
+        function Set-Bits {
+            param(
+                [byte[]]$Data,
+                [int]$StartBit,
+                [uint64]$Value,
+                [int]$Count
+            )
+            $byteOffset = $StartBit -shr 3
+            $bitOffset  = $StartBit -band 7
+
+            $chunkBytes = [byte[]]::new(8)
+            $bytesToCopy = [Math]::Min(8, $Data.Length - $byteOffset)
+            [Array]::Copy($Data, $byteOffset, $chunkBytes, 0, $bytesToCopy)
+            [uint64]$currentData = [BitConverter]::ToUInt64($chunkBytes, 0)
+
+            $mask = ([uint64]1 -shl $Count) - 1
+            if ($Count -eq 64) { $mask = [uint64]::MaxValue }
+            $clearedMask = -bnot ($mask -shl $bitOffset)
+
+            $newData = ($currentData -band $clearedMask) -bor (($Value -band $mask) -shl $bitOffset)
+
+            $modifiedBytes = [BitConverter]::GetBytes($newData)
+            [Array]::Copy($modifiedBytes, 0, $Data, $byteOffset, $bytesToCopy)
+        }
+
+        # Stream / BigInteger packing
+        if ($Stream) {
+            [bigint]$Key = 0
+            $Key = $Key -bor [bigint]$Group
+            $Key = $Key -bor ([bigint]($Serial -band 0x3FFFFFFF) -shl 20)
+            $Key = $Key -bor ([bigint]($Security -band 0x1FFFFFFFFFFFFF) -shl 50)
+
+            if ($IsNKey) { $Key = $Key -bor ([bigint]1 -shl 115) }
+
+            $BinaryData_ = $Key.ToByteArray()
+            if ($BinaryData_.Length -lt 16) { $BinaryData_ += ,0 * (16 - $BinaryData_.Length) }
+            $BinaryData_ = $BinaryData_[0..15]
+
+            $crc = [BinaryKey]::GetKeyChecksum($BinaryData_)
+            if ($crc -band 0x01) { $BinaryData_[12] = $BinaryData_[12] -bor 0x80 }
+            $BinaryData_[13] = [byte](($crc -shr 1) -band 0xFF)
+            if ($crc -band 0x200) { $BinaryData_[14] = $BinaryData_[14] -bor 0x01 }
+        } else {
+            $GROUP_OFFSET    = 0
+            $SERIAL_OFFSET   = 20
+            $SERIAL_BITS     = 30
+            $SECURITY_OFFSET = 50
+            $SECURITY_BITS   = 53
+
+            $BinaryData_ = [byte[]]::new(16)
+            [BitConverter]::GetBytes($Group).CopyTo($BinaryData_, 0)
+            Set-Bits $BinaryData_ $SERIAL_OFFSET   ([uint64]$Serial)   $SERIAL_BITS
+            Set-Bits $BinaryData_ $SECURITY_OFFSET ([uint64]$Security) $SECURITY_BITS
+
+            if ($IsNKey) { $BinaryData_[14] = $BinaryData_[14] -bor 0x08 }
+
+            $crc = [BinaryKey]::GetKeyChecksum($BinaryData_)
+            if ($crc -band 0x001) { $BinaryData_[12] = $BinaryData_[12] -bor 0x80 }
+            $BinaryData_[13] = [byte](($crc -shr 1) -band 0xFF)
+            if ($crc -band 0x200) { $BinaryData_[14] = $BinaryData_[14] -bor 0x01 }
+        }
+
+        return $BinaryData_
+    }
+
+    # Static method version of Unpack-BinaryKey
+    static [PSCustomObject] UnpackBinaryKey(
+        [byte[]]$BinaryData,
+        [bool]$Stream = $true ) {
+
+        # Internal helper function
+        function Get-Bits {
+            param(
+                [byte[]]$Data,
+                [int]$StartBit,
+                [int]$Count
+            )
+
+            $byteOffset = $StartBit -shr 3
+            $bitOffset  = $StartBit -band 7
+
+            $chunkBytes = [byte[]]::new(8)
+            [Array]::Copy($Data, $byteOffset, $chunkBytes, 0, [Math]::Min(8, $Data.Length - $byteOffset))
+            [uint64]$u64 = [BitConverter]::ToUInt64($chunkBytes, 0)
+
+            $mask = ([uint64]1 -shl $Count) - 1
+            if ($Count -eq 64) { $mask = [uint64]::MaxValue }
+
+            return ($u64 -shr $bitOffset) -band $mask
+        }
+
+        if ($Stream) {
+            $TempBytes = $BinaryData[0..15] + [byte]0
+            $Value = [bigint]::new($TempBytes)
+
+            return [PSCustomObject][Ordered]@{
+                Group    = [uint16]($Value -band 0xFFFF)
+                Serial   = [uint32](($Value -shr 20) -band 0x3FFFFFFF)
+                Security = [uint64](($Value -shr 50) -band 0x1FFFFFFFFFFFFF)
+                IsNKey   = (($Value -shr 115) -band 1) -eq 1
+                Checksum = [BinaryKey]::GetKeyChecksum($BinaryData)
+            }
+        } else {
+            $GROUP_OFFSET    = 0
+            $SERIAL_OFFSET   = 20
+            $SERIAL_BITS     = 30
+            $SECURITY_OFFSET = 50
+            $SECURITY_BITS   = 53
+
+            return [PSCustomObject][Ordered]@{
+                Group    = [BitConverter]::ToUInt16($BinaryData, 0)
+                Serial   = [uint32](Get-Bits $BinaryData $SERIAL_OFFSET $SERIAL_BITS)
+                Security = Get-Bits $BinaryData $SECURITY_OFFSET $SECURITY_BITS
+                IsNKey   = (($BinaryData[14] -band 0x08) -ne 0)
+            }
+        }
+    }
+
+    # Static Encoder method
+    static [byte[]] EncodeBinaryKey([string]$CdKey) {
+        $Alphabet = "BCDFGHJKMPQRTVWXY2346789"
+        $RawKey = $CdKey.Replace("-", "").ToUpper()
+        if ($RawKey.Length -ne 25) { throw "Key must be 25 characters." }
+
+        $Digits = New-Object byte[] 25
+        $isNKey_ = $false
+        $digitCount = 0
+
+        foreach ($char in $RawKey.ToCharArray()) {
+            if ($char -eq 'N' -and -not $isNKey_) {
+                $isNKey_ = $true
+                for ($i = $digitCount; $i -gt 0; $i--) {
+                    $Digits[$i] = $Digits[$i-1]
+                }
+                $Digits[0] = [byte]$digitCount
+                $digitCount++
+                continue
+            }
+            $val = $Alphabet.IndexOf($char)
+            if ($val -lt 0) { throw "Invalid character in key: $char" }
+            $Digits[$digitCount] = [byte]$val
+            $digitCount++
+        }
+
+        $Binary = New-Object byte[] 16
+        foreach ($digit in $Digits) {
+            $carry = [uint32]$digit
+            for ($i = 0; $i -lt 16; $i++) {
+                $res = ($Binary[$i] * 24) + $carry
+                $Binary[$i] = [byte]($res -band 0xFF)
+                $carry = $res -shr 8
+            }
+        }
+
+        if ($isNKey_) { $Binary[14] = $Binary[14] -bor 0x08 }
+        return $Binary
+    }
+
+    # Static decoder method
+    static [string] DecodeBinaryKey([byte[]]$bCDKeyArray) {
+        $last = 0
+
+        # Clone input like C++ __m128i
+        $keyData = $bCDKeyArray.Clone()
+
+        # +2 for N` Logic Shift right [else fail]
+        $Src = New-Object char[] 27
+
+        # Base-24 character set
+        $charset = "BCDFGHJKMPQRTVWXY2346789"
+
+        if ($keyData.Length -lt 15 -or $keyData.Length -gt 16) {
+            throw "Input data must be a 15 or 16 byte array."
+        }
+
+        # Win 8 key check
+        if (($keyData[14] -band 0xF0) -ne 0) {
+            throw "Failed to decode key!"
+        }
+
+        # N-flag detection
+        $BYTE14 = [byte]$keyData[14]
+        $flag = (($BYTE14 -band 0x08) -ne 0)
+
+        # Adjust BYTE14 per original algorithm
+        $keyData[14] = (4 * (([int](($BYTE14 -band 8) -ne 0)) -band 2)) -bor ($BYTE14 -band 0xF7)
+
+        # Base-24 decoding loop
+        for ($idx = 24; $idx -ge 0; $idx--) {
+            $last = 0
+            for ($j = 14; $j -ge 0; $j--) {
+                $val = $keyData[$j] + ($last -shl 8)
+                $keyData[$j] = [math]::Floor($val / 0x18)
+                $last = $val % 0x18
+            }
+            $Src[$idx] = $charset[$last]
+        }
+
+        if ($keyData[0] -ne 0) {
+            throw "Invalid product key data"
+        }
+
+        # Handle N-flag
+        $rev = $last -gt 13
+        $pos = if ($rev) { 25 } else { -1 }
+        $T = 0
+
+        if ($flag -and ($last -le 0)) {
+            $Src[0] = [char]78 # 'N'
+        } elseif ($flag -and $rev) {
+            while ($pos-- -gt $last) { $Src[$pos + 1] = $Src[$pos] }
+            $T = 1
+            $Src[$last + 1] = [char]78
+        } elseif ($flag -and !$rev) {
+            while (++$pos -lt $last) { $Src[$pos] = $Src[$pos + 1] }
+            $Src[$last] = [char]78
+        }
+
+        # Format as 5x5 key with dashes
+        $Output = (0..4 | ForEach-Object { -join $Src[((5*$_)+$T)..((5*$_)+4+$T)] }) -join '-'
+
+        return $Output
+    }
+}
+#endregion
+
 #region "Misc"
 <#
 .SYNOPSIS
@@ -2650,6 +3515,133 @@ function Get-SubscriptionStatus {
 }
 #endregion
 #region "FileData"
+# Alternative Load/Export As data Block
+function Load-Block {
+    [CmdletBinding(DefaultParameterSetName = "ToFile")]
+    param (
+        [ValidateNotNullOrEmpty()]
+        [Parameter(Mandatory=$true, Position=1)]
+        [string]$PSPath,
+
+        [ValidateNotNullOrEmpty()]
+        [Parameter(Mandatory=$true, Position=0)]
+        [string]$BlockName,
+
+        [Parameter(Mandatory=$false)]
+        [switch]$SaveOriginal
+    )
+
+    try {
+        # Managed .NET Read (significant speed boost over Get-Content)
+        $content = [System.IO.File]::ReadAllText($PSPath)
+
+        # Managed .NET Regex for extraction
+        $regexPattern = "(?s)## $BlockName ##\r?\n<#\r?\n(.*?)\r?\n#>\r?\n## END ##"
+        $match = [System.Text.RegularExpressions.Regex]::Match($content, $regexPattern)
+
+        if (-not $match.Success) {
+            Write-Warning "Block '## $BlockName ##' not found."
+            return $false
+        }
+
+        # Cleanup Base64 and Decompress via .NET Streams
+        $b64 = $match.Groups[1].Value -replace "[\r\n\s]", ""
+        $data = [System.Convert]::FromBase64String($b64)
+        
+        $msIn = [System.IO.MemoryStream]::new($data)
+        $gzip = [System.IO.Compression.GZipStream]::new($msIn, [System.IO.Compression.CompressionMode]::Decompress)
+        $msOut = [System.IO.MemoryStream]::new()
+        
+        $gzip.CopyTo($msOut)
+        $finalBytes = $msOut.ToArray()
+
+        # Explicit cleanup
+        $gzip.Dispose(); $msIn.Dispose(); $msOut.Dispose()
+
+        # Save original file to Desktop for testing/debugging if requested
+        if ($SaveOriginal) {
+            $desktop = [Environment]::GetFolderPath("Desktop")
+            $outPath = Join-Path $desktop "$BlockName-debug.dll"
+            [System.IO.File]::WriteAllBytes($outPath, $finalBytes)
+            Write-Host "Original file saved to Desktop: $outPath" -ForegroundColor Cyan
+        }
+
+        # Try in-memory load; fallback to temp disk path if it fails
+        try {
+            [System.Reflection.Assembly]::Load($finalBytes) | Out-Null
+        }
+        catch {
+            Write-Verbose "In-memory load failed. Falling back to temp disk load..."
+            $tempPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "$BlockName-$([Guid]::NewGuid()).dll")
+            [System.IO.File]::WriteAllBytes($tempPath, $finalBytes)
+            [System.Reflection.Assembly]::LoadFrom($tempPath) | Out-Null
+        }
+    } catch {
+        Write-Error "Failed to process block $BlockName : $($_.Exception.Message)"
+        return $false
+    }
+}
+function Make-Block {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory=$true)]
+        [string]$BlockName,
+
+        [Parameter(Mandatory=$false)]
+        [string]$OutPath = (Join-Path ([Environment]::GetFolderPath("Desktop")) "TaggedBlob.txt"),
+
+        [int]$LineLength = 120
+    )
+
+    if (-not (Test-Path -LiteralPath $FilePath)) { 
+        Write-Error "File not found: $FilePath"
+        return 
+    }
+
+    try {
+        # 1. Compress using GZipStream (matching Import-Block's decompression)
+        $bytes = [System.IO.File]::ReadAllBytes($FilePath)
+        $msIn = [System.IO.MemoryStream]::new($bytes)
+        $msOut = [System.IO.MemoryStream]::new()
+        
+        $gzip = [System.IO.Compression.GZipStream]::new($msOut, [System.IO.Compression.CompressionLevel]::Optimal)
+        $msIn.CopyTo($gzip)
+        $gzip.Close() # Flushes buffers and writes GZip footer
+
+        # 2. Base64 Conversion
+        $b64 = [Convert]::ToBase64String($msOut.ToArray())
+        
+        $msIn.Dispose()
+        $msOut.Dispose()
+        $gzip.Dispose()
+
+        # 3. Formatting to match Import-Block's regex expectation
+        $sb = [System.Text.StringBuilder]::new()
+        [void]$sb.AppendLine("## $BlockName ##")
+        [void]$sb.AppendLine("<#")
+        for ($i = 0; $i -lt $b64.Length; $i += $LineLength) {
+            $len = [Math]::Min($LineLength, $b64.Length - $i)
+            [void]$sb.AppendLine($b64.Substring($i, $len))
+        }
+        [void]$sb.AppendLine("#>")
+        [void]$sb.AppendLine("## END ##")
+
+        # 4. Save to target path
+        $outDir = Split-Path -Parent $OutPath
+        if ($outDir -and -not (Test-Path $outDir)) {
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        }
+
+        $sb.ToString() | Set-Content -Path $OutPath -Encoding Ascii -Force
+        Write-Host "Tagged block '$BlockName' saved to: $OutPath" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to export block $BlockName : $($_.Exception.Message)"
+    }
+}
 # Load As Type [C# CODE] Or Assembly [DLL]
 function Compress-FileData {
     param (
@@ -2879,6 +3871,12 @@ if (![bool]$isSystem -and ![bool]$isAdmin) {
 
 $Global:PKeyDatabase = Init-XMLInfo
 
+if (!([PSTypeName]'MSFT').Type) {
+  Load-Block -PSPath $PSCommandPath -BlockName MSFT 
+  if (!([PSTypeName]'MSFT').Type) {
+    throw "Error load Nececery MSFT Lib"
+  }
+}
 
 <#
 # due too side effect (activation window crash)
@@ -2946,14 +3944,15 @@ $customObjectArray = $hashTable | ConvertFrom-Csv
 
 # Pre Defined Extract system file's
 $PreDefinedXt = @(
-  "** ERROR:"
-  "** Registry-WMI"
-  "** Interface-Com"
-  "** Kernel-Policies"
-  "** Pfn License Info"
-  "** Pfn License table"
-  "** Store License Info"
-  "** Active License Info"
+  "** ERROR:",
+  "** Registry-WMI",
+  "** Interface-Com",
+  "** Kernel-Policies",
+  "** Pfn License Info",
+  "** Pfn License table",
+  "** Store License Info",
+  "** Active License Info",
+  "** Hardware Identifiers",
   "X:\sources\product.ini",
   "X:\sources\winsetup.dll",
   "X:\sources\setupcore.dll",
@@ -10940,7 +11939,7 @@ function Validate-ProductKey {
     [Array]::Copy($bytes, 0, $KeyData, 0, [Math]::Min(13, $bytes.Length))
     $act_data = [Convert]::ToBase64String($KeyData)
 
-    $value = [HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
+    $value = [System.Web.HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
     $requestXml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope
@@ -11078,7 +12077,7 @@ function Consume-ProductKey {
     if ($LicenseXML[0] -eq [char]0xFEFF) {
         $LicenseXML = $LicenseXML.Substring(1)
     }
-    $LicenseData = [HttpUtility]::HtmlEncode($LicenseXML)
+    $LicenseData = [System.Web.HttpUtility]::HtmlEncode($LicenseXML)
 
     if (!$SkuID -or !$keyInfo -or !$LicenseXML -or !$LicenseURL -or $IndexN) {
         <#
@@ -11119,7 +12118,7 @@ function Consume-ProductKey {
     $bindingData = [System.Convert]::ToBase64String((@($Binding) + @($RandomBytes)))
 
     $secure_store_id = [guid]::NewGuid()
-    $act_config_id = [HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
+    $act_config_id = [System.Web.HttpUtility]::HtmlEncode("msft2009:$SkuID&$act_data")
     $systime = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:sszzz", [System.Globalization.CultureInfo]::InvariantCulture)
     $utctime = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:sszzz", [System.Globalization.CultureInfo]::InvariantCulture)
     $requestXml = @"
@@ -19899,6 +20898,186 @@ function DecodeForm {
     # Show the form
     $form.ShowDialog()
 }
+function IIDForm {
+    # Create the form (wider layout)
+    $form = New-Object System.Windows.Forms.Form
+    $form.Size = New-Object System.Drawing.Size(950, 680)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.BackColor = [System.Drawing.Color]::LightSteelBlue
+
+    # Create a font for labels and inputs
+    $font = New-Object System.Drawing.Font('Segoe UI', 10)
+
+    # Create controls for IID Input
+    $labelKey = New-Object System.Windows.Forms.Label
+    $labelKey.Text = 'Generated IID:'
+    $labelKey.AutoSize = $true
+    $labelKey.Location = New-Object System.Drawing.Point(20, 20)
+    $labelKey.Font =$font
+    $form.Controls.Add($labelKey)
+
+    $inputFieldKey = New-Object System.Windows.Forms.TextBox
+    $inputFieldKey.Location = New-Object System.Drawing.Point(135, 20)
+    $inputFieldKey.Width = 780
+    $inputFieldKey.Font = $font
+    $inputFieldKey.Text = "461121238112207643535798495427899021366981463071071259601106480"
+    $form.Controls.Add($inputFieldKey)
+
+    # Create controls for Last 5 characters
+    $labelConfigPath = New-Object System.Windows.Forms.Label
+    $labelConfigPath.Text = 'Last 5 digits:'
+    $labelConfigPath.AutoSize = $true
+    $labelConfigPath.Location = New-Object System.Drawing.Point(20, 60)
+    $labelConfigPath.Font =$font
+    $form.Controls.Add($labelConfigPath)
+
+    $inputFieldConfigPath = New-Object System.Windows.Forms.TextBox
+    $inputFieldConfigPath.Location = New-Object System.Drawing.Point(135, 60)
+    $inputFieldConfigPath.Width = 780
+    $inputFieldConfigPath.Font = $font
+    $inputFieldConfigPath.Text = 'YY74H'
+    $form.Controls.Add($inputFieldConfigPath)
+
+    # Create the Checkbox for validation
+    $checkboxHexValue = New-Object System.Windows.Forms.CheckBox
+    $checkboxHexValue.Text = 'Validate Keys on Server'
+    $checkboxHexValue.Location = New-Object System.Drawing.Point(135, 100)
+    $checkboxHexValue.AutoSize =$true
+    $checkboxHexValue.Font =$font
+    $form.Controls.Add($checkboxHexValue)
+
+    # Create the Recover button
+    $buttonDecode = New-Object System.Windows.Forms.Button
+    $buttonDecode.Text = 'Recover Keys'
+    $buttonDecode.Location = New-Object System.Drawing.Point(340, 95)
+    $buttonDecode.Width = 575
+    $buttonDecode.Height = 30
+    $buttonDecode.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+    $buttonDecode.BackColor = [System.Drawing.Color]::CadetBlue
+    $buttonDecode.ForeColor = [System.Drawing.Color]::White
+    $buttonDecode.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+
+    $buttonDecode.Add_Click({
+        try {
+            $dataGridView.Rows.Clear()
+            $textBoxLogs.Clear()
+
+            $generatedIid =$inputFieldKey.Text.Trim()
+            $lastInput    =$inputFieldConfigPath.Text.Trim()
+            $doValidate   =$checkboxHexValue.Checked
+
+            # Validate Installation ID (63-64 digits)
+            if ($generatedIid -notmatch '^\d{63,64}$') {
+                [System.Windows.Forms.MessageBox]::Show("Installation ID must be strictly 63 or 64 digits long.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                return
+            }
+
+            # Validate Last 5 Characters Suffix
+            if ([string]::IsNullOrWhiteSpace($lastInput)) {$last = '8HV2C'
+            } 
+            elseif ($lastInput -match '^[A-Za-z0-9]{5}$') {
+                $last =$lastInput.ToUpper()
+            } 
+            else {
+                [System.Windows.Forms.MessageBox]::Show("Please enter exactly 5 alphanumeric characters.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                return
+            }
+
+            $textBoxLogs.AppendText("[$([DateTime]::Now.ToString('HH:mm:ss'))] Starting recovery for IID suffix [$last]...`r`n")
+
+            $decodeObj  = [Activator]::CreateInstance([Type]'DecodedParameters')
+            $readResult = [MSFT]::ReadParametersFromString($generatedIid, [ref]$decodeObj)
+
+            $foundCount = 0
+            [msft]::Recover($generatedIid, $last) | ForEach-Object {
+                $newKey = [BinaryKey]::new($decodeObj.groupID, $decodeObj.serial, $_, $true,$true)
+                if ($newKey.CdKey.EndsWith($last)) {
+                    $foundCount++
+                    $secIdHex = "0x{0:X16}" -f [Int64]$_
+                    $details = "Security ID: $_ ($secIdHex)"
+
+                    $textBoxLogs.AppendText("-> Discovered Key: $($newKey.CdKey) $details`r`n")
+
+                    if ($doValidate) {
+                        try {
+                            $valResult = Validate-ProductKey -ProductKey $newKey.CdKey
+                            #$details += " $valResult"
+                            $textBoxLogs.AppendText("   Server Response: $valResult`r`n")
+                        } catch {
+                            #$details += " | Validation Failed"
+                            $textBoxLogs.AppendText("   Server Response: Exception during validation`r`n")
+                        }
+                    }
+
+                    $dataGridView.Rows.Add($newKey.CdKey, $details)
+                }
+            }
+
+            $textBoxLogs.AppendText("[$([DateTime]::Now.ToString('HH:mm:ss'))] Recovery complete. Found $foundCount matching keys.`r`n")
+
+            if ($foundCount -eq 0) {
+                [System.Windows.Forms.MessageBox]::Show("No matching keys found for the provided inputs.", "Result", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+            }
+        }
+        catch {
+            $err =$_.Exception.Message
+            $textBoxLogs.AppendText("[ERROR] $err`r`n")
+            [System.Windows.Forms.MessageBox]::Show("Error: $err", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        }
+    })
+    $form.Controls.Add($buttonDecode)
+
+    # Create TabControl for organizing outputs
+    $tabControl = New-Object System.Windows.Forms.TabControl
+    $tabControl.Location = New-Object System.Drawing.Point(20, 145)
+    $tabControl.Size = New-Object System.Drawing.Size(895, 475)
+    $tabControl.Font =$font
+
+    # Tab 1: Recovered Keys Grid
+    $tabGrid = New-Object System.Windows.Forms.TabPage
+    $tabGrid.Text = "Recovered Keys"
+    $tabGrid.BackColor = [System.Drawing.Color]::White
+
+    $dataGridView = New-Object System.Windows.Forms.DataGridView
+    $dataGridView.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $dataGridView.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::None
+    $dataGridView.ColumnCount = 2
+    $dataGridView.Columns[0].Name = 'Product Key'
+    $dataGridView.Columns[1].Name = 'Security ID & Details'
+    $dataGridView.Columns[0].Width = 300
+    $dataGridView.Columns[1].Width = 590
+    $dataGridView.AllowUserToAddRows = $false
+    $dataGridView.AllowUserToDeleteRows = $false
+    $dataGridView.RowTemplate.Height = 28
+    $dataGridView.ColumnHeadersHeight = 38
+    $tabGrid.Controls.Add($dataGridView)
+
+    # Tab 2: Server Response Logs
+    $tabLogs = New-Object System.Windows.Forms.TabPage
+    $tabLogs.Text = "Server Response Logs"
+    $tabLogs.BackColor = [System.Drawing.Color]::White
+
+    $textBoxLogs = New-Object System.Windows.Forms.TextBox
+    $textBoxLogs.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $textBoxLogs.Multiline =$true
+    $textBoxLogs.ReadOnly =$true
+    $textBoxLogs.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $textBoxLogs.Font = New-Object System.Drawing.Font('Consolas', 9.5)
+    $textBoxLogs.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $textBoxLogs.ForeColor = [System.Drawing.Color]::FromArgb(0, 255, 128) # Hacker green on dark background
+    $tabLogs.Controls.Add($textBoxLogs)
+
+    # Add tabs to control
+    $tabControl.Controls.Add($tabGrid)
+    $tabControl.Controls.Add($tabLogs)
+    $form.Controls.Add($tabControl)
+
+    # Show the form
+    [void]$form.ShowDialog()
+}
 function GetWmiProductsForm {
 
     # Create the form
@@ -20855,6 +22034,22 @@ Function ExtractForm {
             $dataGridView.Rows.Add("KeyQuality", $Licinfo.KeyQuality)
             $dataGridView.Rows.Add("ConcurrencyLimit", $Licinfo.ConcurrencyLimit)
 
+            return
+        }
+        if ($textBoxSource.Text -eq "** Hardware Identifiers") {
+
+            $dataGridView.Columns.Add("Property", "Property")
+            $dataGridView.Columns["Property"].Width = 550 
+            $dataGridView.Columns.Add("Description", "Value / Identifier")
+            $dataGridView.Columns["Description"].Width = 650 
+            $dataGridView.RowTemplate.Height = 30
+
+            $hwidInfo = Get-SystemHardwareIdentifiers
+            if ($hwidInfo) {
+                $dataGridView.Rows.Add("Extracted HWID (from IID)", $(if ($hwidInfo.ExtractedHwid) { $hwidInfo.ExtractedHwid } else { "N/A" }))
+                $dataGridView.Rows.Add("Store License HWID", $(if ($hwidInfo.StoreHwid) { $hwidInfo.StoreHwid } else { "N/A" }))
+                $dataGridView.Rows.Add("WinRT HWID (Low-Level)", $(if ($hwidInfo.WinRtHwid) { $hwidInfo.WinRtHwid } else { "N/A" }))
+            }
             return
         }
 
@@ -22074,7 +23269,7 @@ function Main-Form {
     $statusBox.ReadOnly = $true
     $statusBox.Font = New-Object Drawing.Font('Segoe UI', 10)
     $statusBox.Location = New-Object Drawing.Point(20, 500)
-    $statusBox.Size = New-Object Drawing.Size(760, 40) 
+    $statusBox.Size = New-Object Drawing.Size(600, 40) 
     $statusBox.BackColor = [System.Drawing.Color]::White
     $statusBox.BorderStyle = 'FixedSingle'
 
@@ -22126,7 +23321,7 @@ function Main-Form {
     $Global:edition = Get-ProductID
     $Global:memory = [math]::round((Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
     $Global:version = "$($Global:osVersion.Version -join '.').$($Global:osVersion.UBR)"  
-    $statusBox.Text = "System Info: $ProductDescription ($Global:arch) | $($Global:version) | $([math]::Round($Global:memory)) GB"
+    $statusBox.Text = "$ProductDescription ($Global:arch) | $($Global:version) | $([math]::Round($Global:memory)) GB"
 
     # Create Status Info button (fixed position near statusBox)
     $AboutButton = New-Object Windows.Forms.Button
@@ -22137,6 +23332,16 @@ function Main-Form {
     $AboutButton.BackColor = [Color]::SlateGray
     $AboutButton.ForeColor = [Color]::White
     $AboutButton.FlatStyle = 'Flat'
+
+    # Create Status Info button (fixed position near statusBox)
+    $RecoverButton = New-Object Windows.Forms.Button
+    $RecoverButton.Text = 'IID Key Recovery'
+    $RecoverButton.Location = New-Object Point(630, 500)  # Fixed position near statusBox
+    $RecoverButton.Size = New-Object Size(150, 40)  # Button size (120px wide)
+    $RecoverButton.Font = New-Object Font('Segoe UI', 10, [FontStyle]::Bold)
+    $RecoverButton.BackColor = [Color]::SlateGray
+    $RecoverButton.ForeColor = [Color]::White
+    $RecoverButton.FlatStyle = 'Flat'
 
     # Create Wmi Info button (fixed position near Status button, calculated to fit before Close button)
     $WmiButton = New-Object Windows.Forms.Button
@@ -22206,6 +23411,9 @@ function Main-Form {
     })
     $WmiButton.Add_Click({
         WMI_Form
+    })
+    $RecoverButton.Add_Click({
+        IIDForm
     })
     $form.Add_KeyDown({
         if ($_.KeyCode -eq [Keys]::Enter) {
@@ -22311,6 +23519,7 @@ function Main-Form {
     $form.Controls.Add($statusBox)
     $form.Controls.Add($statusLabel)
     $form.Controls.Add($WmiButton)
+    $form.Controls.Add($RecoverButton)
 
     # Add mouse event handlers to make the form movable
     $form.Add_MouseDown({
@@ -22384,7 +23593,7 @@ function Main-Form {
         }
             
         # Update the label text
-        $statusBox.Text = "System Info: $ProductDescription ($Global:arch) | $($Global:version) | $([math]::Round($Global:memory)) GB"
+        $statusBox.Text = "$ProductDescription ($Global:arch) | $($Global:version) | $([math]::Round($Global:memory)) GB"
 
     })
     $timer.Start()
