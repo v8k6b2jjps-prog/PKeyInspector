@@ -917,10 +917,10 @@ function Get-SystemHardwareIdentifiers {
     param()
 
     try {
-        $offlineIid    =$null
-        $extractedHwid =$null
-        $storeHwid     =$null
-        $winRtHwid     =$null
+        $offlineIid    = $null
+        $extractedHwid = $null
+        $storeHwid     = $null
+        $winRtHwid     = $null
 
         # 1. Extract WMI Offline Installation ID & Decoded HWID
         $InstallationIdList = Get-CimInstance -Query "SELECT ID, OfflineInstallationId FROM SoftwareLicensingProduct WHERE PartialProductKey IS NOT NULL AND OfflineInstallationId IS NOT NULL" -ErrorAction SilentlyContinue
@@ -958,7 +958,7 @@ function Get-SystemHardwareIdentifiers {
             # Try using Byte Pattern
             if ($sub -le 0) {
                 try {
-                    $sub = Get-HwidRVA -dllpath$WinrtDll
+                    $sub = Get-HwidRVA -dllpath $WinrtDll
                 } catch {}
             }
 
