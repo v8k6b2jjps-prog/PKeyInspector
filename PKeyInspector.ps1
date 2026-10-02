@@ -21349,7 +21349,7 @@ function DecodeForm {
     $buttonBrowse.Text = 'Browse...'
     $buttonBrowse.Location = New-Object Point(680, 100)
     $buttonBrowse.Width = 80
-    $buttonBrowse.Height = $inputFieldConfigPath.Height  # Match height with TextBox
+    $buttonBrowse.Height = 30
     $buttonBrowse.Font = $font
     $buttonBrowse.Add_Click({
         $openFileDialog = New-Object OpenFileDialog
@@ -21370,11 +21370,29 @@ function DecodeForm {
     $labelFolderPath.Font = $font
     $form.Controls.Add($labelFolderPath)
 
-    $inputFieldFolderPath = New-Object TextBox
+    # Folder path: presets + Custom (editable combo box)
+    $inputFieldFolderPath = New-Object ComboBox
     $inputFieldFolderPath.Location = New-Object Point(120, 140)
     $inputFieldFolderPath.Width = 550  # Adjust width
     $inputFieldFolderPath.Font = $font
-    $inputFieldFolderPath.Text = $outPath
+    $inputFieldFolderPath.DropDownStyle = [ComboBoxStyle]::DropDown   # editable
+
+    [void]$inputFieldFolderPath.Items.Add('Custom')
+    foreach ($name in 'windows', 'office', 'embedded', 'visualstudio') {
+        [void]$inputFieldFolderPath.Items.Add("C:\Windows\Temp\pkeyconfigs\$name")
+    }
+    $inputFieldFolderPath.SelectedIndex = 1   # start on ...\pkeyconfigs\windows
+
+    # Picking "Custom" empties the box so a path can be typed (or use Browse)
+    $inputFieldFolderPath.Add_SelectionChangeCommitted({
+        if ($this.SelectedItem -eq 'Custom') {
+            $combo = $this
+            [void]$combo.BeginInvoke([Action]{
+                $combo.Text = ''
+                $combo.Focus()
+            }.GetNewClosure())
+        }
+    })
     $form.Controls.Add($inputFieldFolderPath)
 
     # Browse button for folder selection
@@ -21382,12 +21400,18 @@ function DecodeForm {
     $buttonBrowseFolder.Text = 'Browse...'
     $buttonBrowseFolder.Location = New-Object Point(680, 140)
     $buttonBrowseFolder.Width = 80
-    $buttonBrowseFolder.Height = $inputFieldFolderPath.Height  # Match height with TextBox
+    $buttonBrowseFolder.Height = 30
     $buttonBrowseFolder.Font = $font
     $buttonBrowseFolder.Add_Click({
         $folderBrowserDialog = New-Object FolderBrowserDialog
         $folderBrowserDialog.Description = 'Select a Folder'
-        
+
+        # Open the dialog at the folder currently shown, if it exists
+        $current = $inputFieldFolderPath.Text
+        if ($current -and (Test-Path -LiteralPath $current -PathType Container)) {
+            $folderBrowserDialog.SelectedPath = $current
+        }
+
         if ($folderBrowserDialog.ShowDialog() -eq 'OK') {
             $inputFieldFolderPath.Text = $folderBrowserDialog.SelectedPath
         }
@@ -21412,282 +21436,222 @@ function DecodeForm {
     $buttonDecode.ForeColor = [Color]::White
     $buttonDecode.FlatStyle = 'Flat'
 
-    $buttonDecode.Add_Click({
-        try {
-			# Clear any existing rows
-            $dataGridView.Rows.Clear()
-			Start-Sleep -Seconds 1
-
-            $key = $inputFieldKey.Text -replace '\s+', ''
-            $configPath = $inputFieldConfigPath.Text
-            $configFolder = $inputFieldFolderPath.Text
-            $hexValue = $checkboxHexValue.Checked
-
-            $isFileValid = -not [string]::IsNullOrWhiteSpace($configPath) -and (Test-Path $configPath) -and $configPath -match '^[A-Z]:\\.*\.xrm-ms$'  # Updated validation
-            $isFolderValid = -not [string]::IsNullOrWhiteSpace($configFolder) -and (Test-Path $configFolder) -and (Get-Item $configFolder).PSIsContainer
-            $isKeyValid = $key -match '^[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}$'
-
-            if (!$isKeyValid -or (!$isFileValid -and !$isFolderValid)) {
-                $message = "Please check the following:" + [Environment]::NewLine
-                if (-not $isKeyValid) {
-                    $message += "- KEY must be in the correct format." + [Environment]::NewLine
-                }
-                if (-not $isFileValid) {
-                    $message += "- CONFIG PATH cannot be empty and must end with '.xrm-ms'." + [Environment]::NewLine
-                }
-                if (-not $isFolderValid) {
-                    $message += "- FOLDER PATH cannot be empty." + [Environment]::NewLine
-                }
-    
-                [MessageBox]::Show($message, "Error", [MessageBoxButtons]::OK, [MessageBoxIcon]::Error)
-                return
+      # ========================================================================
+    # Decode button
+    #
+    # Paste this in place of the old $buttonDecode.Add_Click({ ... }) block.
+    # The helper functions must sit in the same scope where $form,
+    # $dataGridView and the input fields are created (i.e. right here).
+    # ========================================================================
+ 
+    # 2009 keys carry the letter N; 2005 keys never do.
+    function Test-Is2009Key {
+        param([string]$Key)
+        return $Key.Contains('N')
+    }
+ 
+    # Tsforge-style extended PID for the online check of a 2005 key.
+    function Get-ExtendedPid {
+        param(
+            [long]$Serial,
+            [int]$Group,
+            [string]$EulaType = 'Retail',
+            [string]$Mpc = '00000'
+        )
+        $now = Get-Date
+        $licenseType = switch ($EulaType.ToUpper()) { 'OEM' { 2 } 'VOLUME' { 3 } default { 0 } }
+ 
+        [String]::Format(
+            '{0}-{1:D5}-{2:D3}-{3:D6}-{4:D2}-{5:D4}-{6:D4}.0000-{7:D3}{8:D4}',
+            $Mpc,
+            $Group,
+            [int][Math]::Floor($Serial / 1000000),
+            [int]($Serial % 1000000),
+            $licenseType,
+            [System.Globalization.CultureInfo]::CurrentCulture.LCID,
+            [Environment]::OSVersion.Version.Build,
+            $now.DayOfYear,
+            $now.Year
+        )
+    }
+ 
+    # Adds Property/Value items to the grid, skipping fully empty ones.
+    function Add-PropertyRows {
+        param($Items, [bool]$Hex = $false)
+        foreach ($item in $Items) {
+            if ([string]::IsNullOrWhiteSpace($item.Property) -and [string]::IsNullOrWhiteSpace($item.Value)) { continue }
+            $value = $item.Value
+            if ($Hex) {
+                try { $value = $item.Value.ToString('X') } catch { $value = $item.Value }  # non-numeric: leave as is
             }
-        } catch {
-            [MessageBox]::Show("Error: $_", "Error", [MessageBoxButtons]::OK, [MessageBoxIcon]::Error)
+            [void]$dataGridView.Rows.Add($item.Property, $value)
         }
-
-        if ($key -notcontains 'N' -and -not [System.IO.File]::Exists((Join-Path $PSScriptRoot "PkeyLib.dll"))) {
-            [System.Windows.MessageBox]::Show("Required file PkeyLib.dll is missing.", "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+    }
+ 
+    # 2005 key: asks PkeyLib.dll. Returns @{ Uid; Group } on success, $null otherwise.
+    function Test-Pkey2005 {
+        param([string]$Key, [string]$ConfigPath)
+        $group = 0
+        $uidBytes = [byte[]]::new(8)
+        if ([PkeyNative]::VerifyAndExtractKeyByRef($Key, $ConfigPath, $uidBytes, [ref]$group)) {
+            return @{ Uid = $uidBytes; Group = $group }
+        }
+        return $null
+    }
+ 
+    # 2005 key: fills the grid for a successful match and runs both online checks.
+    function Show-Pkey2005Result {
+        param([string]$Key, [string]$ConfigPath, $Match)
+ 
+        $data = Get-PkeyInfo -Uid $Match.Uid -Group $Match.Group -ConfigPath $ConfigPath
+        foreach ($name in 'Upgrade', 'Serial', 'Auth', 'Group', 'ActConfigId', 'Edition', 'Description',
+                          'PartNumber', 'EulaType', 'RangeValid', 'ActString', 'HWID', 'OfflineAct') {
+            [void]$dataGridView.Rows.Add($name, $data.$name)
+        }
+ 
+        $status1, $status2 = $null, $null
+        try {
+            $ext = Get-ExtendedPid -Serial $data.Serial -Group $data.Group
+            $status1 = Call-WebService -requestType 2 -extendedProductId $ext
+        } catch {}
+        try {
+            $status2 = Validate-ProductKey -ProductKey $Key -ActivationString $data.ActString -algorithm '2005'
+        } catch {}
+        [void]$dataGridView.Rows.Add('Online Check', $status1)
+        [void]$dataGridView.Rows.Add('Online Check', $status2)
+    }
+ 
+    # 2009 key: fills the grid from a Key-Parser result and runs both online checks.
+    function Show-Pkey2009Result {
+        param([string]$Key, $Result)
+ 
+        $skuID = [guid]::Empty
+        foreach ($item in $Result) {
+            if ($item.Property -eq 'ActivationId') { $skuID = [guid]::new($item.Value) }
+        }
+        Add-PropertyRows -Items $Result
+ 
+        $status1, $status2 = $null, $null
+        try {
+            $advancedPid = $Result | Where-Object { $_['Property'] -eq 'AdvancedPid' } | ForEach-Object { $_['Value'] }
+            $status1 = Call-WebService -requestType 2 -extendedProductId $advancedPid
+        } catch {}
+        try {
+            $status2 = Validate-ProductKey -ProductKey ($Key.Substring(0, 29)) -SkuID $skuID
+        } catch {}
+        [void]$dataGridView.Rows.Add('Online Check', $status1)
+        [void]$dataGridView.Rows.Add('Online Check', $status2)
+    }
+ 
+    $buttonDecode.Add_Click({
+ 
+        # ---- 1. Read and validate the inputs ---------------------------------
+        $key          = ($inputFieldKey.Text -replace '\s+', '').ToUpper()
+        $configPath   = $inputFieldConfigPath.Text
+        $configFolder = $inputFieldFolderPath.Text
+        $hexValue     = $checkboxHexValue.Checked
+ 
+        $isKeyValid    = $key -match '^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$'
+        $isFileValid   = -not [string]::IsNullOrWhiteSpace($configPath) -and
+                         ($configPath -match '^[A-Z]:\\.*\.xrm-ms$') -and
+                         (Test-Path -LiteralPath $configPath -PathType Leaf)
+        $isFolderValid = -not [string]::IsNullOrWhiteSpace($configFolder) -and
+                         (Test-Path -LiteralPath $configFolder -PathType Container)
+ 
+        $problems = @()
+        if (-not $isKeyValid) { $problems += '- KEY must be in the correct format.' }
+        if (-not $isFileValid -and -not $isFolderValid) {
+            $problems += "- Give either a CONFIG PATH ending in '.xrm-ms' or an existing FOLDER PATH."
+        }
+        if ($problems.Count -gt 0) {
+            $message = "Please check the following:`r`n" + ($problems -join "`r`n")
+            [void][MessageBox]::Show($message, 'Error', [MessageBoxButtons]::OK, [MessageBoxIcon]::Error)
             return
         }
-
-        # Results from KeyDecode (USING KeyInfo Tool, decode method)
-        try {
-            if ($key -contains 'N') {
-                $result = KeyDecode -key0 $key
-                $RefGroupId = $result.GetValue(2).Value
-                $data = $result | Where-Object { (![STRING]::IsNullOrWhiteSpace($_.Property)) -or (![STRING]::IsNullOrWhiteSpace($_.Value)) }
-                foreach ($item in $data) {
-                    $value = if ($hexValue) { $item.Value.ToString("X") } else { $item.Value }
-                    $dataGridView.Rows.Add($item.Property, $value)
-                }
-            }
-        } catch {
-            # Windows 7 key .. etc.
-            if ($isFileValid -and (-not $isFolderValid)) {
-                $dataGridView.Rows.Add('Error', $_) }
-            # return
+ 
+        $is2009 = Test-Is2009Key -Key $key
+ 
+        if (-not $is2009 -and -not [System.IO.File]::Exists((Join-Path $PSScriptRoot 'PkeyLib.dll'))) {
+            [void][MessageBox]::Show('Required file PkeyLib.dll is missing.', 'Error', [MessageBoxButtons]::OK, [MessageBoxIcon]::Error)
+            return
         }
-
-        # Initialize an array to hold .xrm-ms files
-        $xrm_ms_lst = @()
-
-        # Check file and folder validity
-        if ($isFileValid -and (-not $isFolderValid)) {
-
-            # Results from Key-Parser (USING PidgenX API)
-            if ($key -notcontains 'N') {
-                $group = 0
-                $uidBytes = [byte[]]::new(8)
-                $success = [PkeyNative]::VerifyAndExtractKeyByRef(
-                    $key, $configPath, $uidBytes, [ref]$group )
-                if ($success) {
-                    $data = Get-PkeyInfo -Uid $uidBytes -Group $group -ConfigPath $configPath
-                    $dataGridView.Rows.Add('Upgrade', $data.Upgrade)
-                    $dataGridView.Rows.Add('Serial', $data.Serial)
-                    $dataGridView.Rows.Add('Auth', $data.Auth)
-                    $dataGridView.Rows.Add('Group', $data.Group)
-                    $dataGridView.Rows.Add('ActConfigId', $data.ActConfigId)
-                    $dataGridView.Rows.Add('Edition', $data.Edition)
-                    $dataGridView.Rows.Add('Description', $data.Description)
-                    $dataGridView.Rows.Add('PartNumber', $data.PartNumber)
-                    $dataGridView.Rows.Add('EulaType', $data.EulaType)
-                    $dataGridView.Rows.Add('RangeValid', $data.RangeValid)
-                    $dataGridView.Rows.Add('ActString', $data.ActString)
-                    $dataGridView.Rows.Add('HWID', $data.HWID)
-                    $dataGridView.Rows.Add('OfflineAct', $data.OfflineAct)
-
-                    # Tsforge Project
-                    $GetExtendedPid = {
-                        param (
-                          [long]$Serial,
-                          [int]$Group,
-                          [string]$EulaType = "Retail",
-                          [string]$Mpc = "00000"
-                        )
-
-                        $now = Get-Date
-                        $licenseType = switch ($EulaType.ToUpper()) { "OEM" { 2 } "VOLUME" { 3 } default { 0 } }
-
-                        [String]::Format(
-                            "{0}-{1:D5}-{2:D3}-{3:D6}-{4:D2}-{5:D4}-{6:D4}.0000-{7:D3}{8:D4}",
-                            $Mpc,
-                            $Group,
-                            [int][Math]::Floor($Serial / 1000000),
-                            [int]($Serial % 1000000),
-                            $licenseType,
-                            [System.Globalization.CultureInfo]::CurrentCulture.LCID,
-                            [Environment]::OSVersion.Version.Build,
-                            $now.DayOfYear,
-                            $now.Year
-                        )
-                    }
-
-                    $status1, $status2 = $null, $null
-                    try {
-                        $ext = & $GetExtendedPid -Serial $data.Serial -Group $data.Group
-                        $status1 = Call-WebService `
-                            -requestType 2 `
-                            -extendedProductId $ext
-                    } catch {}
-
-                    try {
-                        $status2 = Validate-ProductKey `
-                            -ProductKey $key `
-                            -ActivationString $data.ActString `
-                            -algorithm '2005'
-                    } catch {}
-
-                    $dataGridView.Rows.Add("Online Check", $status1)
-                    $dataGridView.Rows.Add("Online Check", $status2)
-                }
-                return                       
-            }
-
-            $skuID = [guid]::Empty
-            $result = Key-Parser -key $key -configPath $configPath
-            $data = $result | Where-Object { (![STRING]::IsNullOrWhiteSpace($_.Property)) -or (![STRING]::IsNullOrWhiteSpace($_.Value)) }
-            foreach ($item in $data) {
-                if ($item.Property -eq 'ActivationId') {
-                    $skuID = [GUID]::new($item.Value)
-                }
-                $dataGridView.Rows.Add($item.Property, $item.Value)
-            }
-            $status1, $status2 = $null, $null
-            try {
-                $status1 = Call-WebService `
-                -requestType 2 `
-                -extendedProductId (
-                    $result | ? {$_["Property"] -eq 'AdvancedPid' } | % { $_["Value"] }
-                )
-            } catch {}
-            try {
-                $status2 = Validate-ProductKey `
-                    -ProductKey ($key.Substring(0,29)) `
-                    -SkuID $skuID
-            } catch {}
-            $dataGridView.Rows.Add("Online Check", $status1)
-            $dataGridView.Rows.Add("Online Check", $status2)
-
-        } elseif ($isFolderValid) {
-
-            # Include the file if valid
-            if ($isFileValid) { $xrm_ms_lst += $configPath }
-
-            # Get all .xrm-ms files from the folder
-            $xrmFiles = Get-ChildItem -Path $configFolder -Filter '*.xrm-ms' -Recurse -EA 0
-            $xrm_ms_lst += $xrmFiles.FullName  # Add the file paths to the list
-
-            # Process each .xrm-ms file
-            foreach ($file in $xrm_ms_lst) {
-                # Validate Key-Parser results for each .xrm-ms file
+ 
+        # ---- 2. Which config files to try ------------------------------------
+        # File only -> just that file. Folder given -> the file (if any) first,
+        # then every .xrm-ms under the folder.
+        $singleFile = $isFileValid -and -not $isFolderValid
+        $files = @()
+        if ($isFileValid) { $files += $configPath }
+        if ($isFolderValid) {
+            $files += @(Get-ChildItem -LiteralPath $configFolder -Filter '*.xrm-ms' -Recurse -File -ErrorAction SilentlyContinue |
+                        ForEach-Object { $_.FullName })
+        }
+ 
+        # ---- 3. Run ----------------------------------------------------------
+        $dataGridView.Rows.Clear()
+        $buttonDecode.Enabled = $false      # no second click while this one runs
+        $oldTitle = $form.Text
+        try {
+            # 2009 key: offline decode first (KeyInfo tool); needs no config file.
+            if ($is2009) {
                 try {
-                    if ($key -notcontains 'N') {
-                        $group = 0
-                        $uidBytes = [byte[]]::new(8)
-                        $success = [PkeyNative]::VerifyAndExtractKeyByRef(
-                        $key, $file, $uidBytes, [ref]$group )
-
-                        if ($success) {
+                    Add-PropertyRows -Items (KeyDecode -key0 $key) -Hex $hexValue
+                } catch {
+                    if ($singleFile) { [void]$dataGridView.Rows.Add('Error', $_) }
+                }
+            }
+ 
+            $found = $false
+            for ($i = 0; $i -lt $files.Count; $i++) {
+                $file = $files[$i]
+ 
+                # Show progress and let the window repaint / move / respond
+                # between files, instead of freezing for the whole scan.
+                $form.Text = "$oldTitle - checking $($i + 1) of $($files.Count)"
+                [Application]::DoEvents()
+                if ($form.IsDisposed) { return }    # window was closed mid-scan
+ 
+                try {
+                    if ($is2009) {
+                        # PidgenX API
+                        $result = Key-Parser -key $key -configPath $file
+                        if ($singleFile -or $result.GetValue(1).Property -ne 'Error') {
                             $inputFieldConfigPath.Text = $file
-                            $data = Get-PkeyInfo -Uid $uidBytes -Group $group -ConfigPath $file
-                            $dataGridView.Rows.Add('Upgrade', $data.Upgrade)
-                            $dataGridView.Rows.Add('Serial', $data.Serial)
-                            $dataGridView.Rows.Add('Auth', $data.Auth)
-                            $dataGridView.Rows.Add('Group', $data.Group)
-                            $dataGridView.Rows.Add('ActConfigId', $data.ActConfigId)
-                            $dataGridView.Rows.Add('Edition', $data.Edition)
-                            $dataGridView.Rows.Add('Description', $data.Description)
-                            $dataGridView.Rows.Add('PartNumber', $data.PartNumber)
-                            $dataGridView.Rows.Add('EulaType', $data.EulaType)
-                            $dataGridView.Rows.Add('RangeValid', $data.RangeValid)
-                            $dataGridView.Rows.Add('ActString', $data.ActString)
-                            $dataGridView.Rows.Add('HWID', $data.HWID)
-                            $dataGridView.Rows.Add('OfflineAct', $data.OfflineAct)
-                            
-                            # Tsforge Project
-                            $GetExtendedPid = {
-                                param (
-                                  [long]$Serial,
-                                  [int]$Group,
-                                  [string]$EulaType = "Retail",
-                                  [string]$Mpc = "00000"
-                                )
-
-                                $now = Get-Date
-                                $licenseType = switch ($EulaType.ToUpper()) { "OEM" { 2 } "VOLUME" { 3 } default { 0 } }
-
-                                [String]::Format(
-                                    "{0}-{1:D5}-{2:D3}-{3:D6}-{4:D2}-{5:D4}-{6:D4}.0000-{7:D3}{8:D4}",
-                                    $Mpc,
-                                    $Group,
-                                    [int][Math]::Floor($Serial / 1000000),
-                                    [int]($Serial % 1000000),
-                                    $licenseType,
-                                    [System.Globalization.CultureInfo]::CurrentCulture.LCID,
-                                    [Environment]::OSVersion.Version.Build,
-                                    $now.DayOfYear,
-                                    $now.Year
-                                )
-                            }
-
-                            $status1, $status2 = $null, $null
-                            try {
-                                $ext = & $GetExtendedPid -Serial $data.Serial -Group $data.Group
-                                $status1 = Call-WebService `
-                                    -requestType 2 `
-                                    -extendedProductId $ext
-                            } catch {}
-                            try {
-                                $status2 = Validate-ProductKey `
-                                    -ProductKey $key `
-                                    -ActivationString $data.ActString `
-                                    -algorithm '2005'
-                            } catch {}
-
-                            $dataGridView.Rows.Add("Online Check", $status1)
-                            $dataGridView.Rows.Add("Online Check", $status2)
-
+                            $form.Text = "$oldTitle - online check"
+                            [Application]::DoEvents()
+                            Show-Pkey2009Result -Key $key -Result $result
+                            $found = $true
                             break
                         }
-
-                        continue
                     }
-
-                    $result = Key-Parser -key $key -configPath $file
-                    if ($result.GetValue(1).Property -ne 'Error') {
-                        $inputFieldConfigPath.Text = $file
-
-                        # Results from Key-Parser (USING PidgenX API)
-                        $skuID = [guid]::Empty
-                        $data = $result | Where-Object { (![STRING]::IsNullOrWhiteSpace($_.Property)) -or (![STRING]::IsNullOrWhiteSpace($_.Value)) }
-                        foreach ($item in $data) {
-                            if ($item.Property -eq 'ActivationId') {
-                                $skuID = [GUID]::new($item.Value)
-                            }
-                            $dataGridView.Rows.Add($item.Property, $item.Value)
+                    else {
+                        # PkeyLib.dll
+                        $hit = Test-Pkey2005 -Key $key -ConfigPath $file
+                        if ($hit) {
+                            $inputFieldConfigPath.Text = $file
+                            $form.Text = "$oldTitle - online check"
+                            [Application]::DoEvents()
+                            Show-Pkey2005Result -Key $key -ConfigPath $file -Match $hit
+                            $found = $true
+                            break
                         }
-                        $status1, $status2 = $null, $null
-                        try {
-                            $status1 = Call-WebService `
-                            -requestType 2 `
-                            -extendedProductId (
-                               $result | ? {$_["Property"] -eq 'AdvancedPid' } | % { $_["Value"] }
-                            )
-                        } catch {}
-                        try {
-                            $status2 = Validate-ProductKey `
-                                -ProductKey ($key.Substring(0,29)) `
-                                -SkuID $skuID
-                        } catch {}
-                        $dataGridView.Rows.Add("Online Check", $status1)
-                        $dataGridView.Rows.Add("Online Check", $status2)
-
-                        break  # Exit after processing the first valid file
                     }
                 } catch {
-                    # Handle errors during Key-Parser call (optionally log or handle)
+                    # One bad config file must not stop the scan.
                 }
+            }
+ 
+            if (-not $found) {
+                [void]$dataGridView.Rows.Add('Result', "Key did not validate against $($files.Count) config file(s).")
+            }
+        }
+        catch {
+            [void][MessageBox]::Show("Error: $_", 'Error', [MessageBoxButtons]::OK, [MessageBoxIcon]::Error)
+        }
+        finally {
+            if (-not $form.IsDisposed) {
+                $form.Text = $oldTitle
+                $buttonDecode.Enabled = $true
             }
         }
     })
