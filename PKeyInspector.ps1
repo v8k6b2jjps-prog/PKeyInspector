@@ -1448,6 +1448,9 @@ using System.Runtime.InteropServices;
 
 public static class PkeyNative
 {
+    [DllImport("kernel32.dll")]
+    public static extern ushort GetSystemDefaultLangID();
+
     [DllImport(
         "PkeyLib.dll",
         EntryPoint = "VerifyAndExtractKeyByRef",
@@ -21378,6 +21381,7 @@ function DecodeForm {
     $inputFieldFolderPath.DropDownStyle = [ComboBoxStyle]::DropDown   # editable
 
     [void]$inputFieldFolderPath.Items.Add('Custom')
+    [void]$inputFieldFolderPath.Items.Add('C:\Windows\System32\spp\tokens')
     foreach ($name in 'windows', 'office', 'embedded', 'visualstudio') {
         [void]$inputFieldFolderPath.Items.Add("C:\Windows\Temp\pkeyconfigs\$name")
     }
@@ -21508,6 +21512,64 @@ function DecodeForm {
                           'PartNumber', 'EulaType', 'RangeValid', 'ActString', 'HWID', 'OfflineAct') {
             [void]$dataGridView.Rows.Add($name, $data.$name)
         }
+
+$GetPid2 = {
+    param (
+        [long]$Serial,
+        [int]$Group,
+        [string]$EulaType = "Retail",
+        [string]$Mpc = "00000"
+    )
+
+    $groupPart = ($Group -shr 1) % 100
+    $high      = [int]([Math]::Floor($Serial / 1000000) % 1000)   # clamped like the real code
+    $low       = [int]($Serial % 1000000)
+
+    if ($EulaType -like 'OEM*') {
+        $serialHigh = 'OEM'
+        $serialLow  = [int]([Math]::Floor($low / 100000) + 10 * ($high + 1000 * $groupPart))
+        $lastPart   = [int]($Serial % 100000)
+    }
+    else {
+        $serialHigh = '{0:D3}' -f $high
+        $serialLow  = $low
+        $lastPart   = [int]($groupPart * 1000 + (Get-Random -Maximum 1000))
+    }
+
+    # Digit sum of serialLow, mod-7 check digit (1..7, never 0)
+    $sum = 0
+    foreach ($ch in $serialLow.ToString().ToCharArray()) { $sum += [int]$ch - 48 }
+    $checksum = 7 - ($sum % 7)
+
+    '{0}-{1}-{2:D6}{3}-{4:D5}' -f $Mpc, $serialHigh, $serialLow, $checksum, $lastPart
+}
+$GetExtendedPid = {
+    param (
+        [long]$Serial,
+        [int]$Group,
+        [string]$EulaType = "Retail",
+        [string]$Mpc = "00000"
+    )
+
+    $now = Get-Date
+    $licenseType = switch -Wildcard ($EulaType) { 'OEM*' { 2 } 'Volume*' { 3 } default { 0 } }
+
+    [String]::Format(
+        "{0}-{1:D5}-{2:D3}-{3:D6}-{4:D2}-{5:D4}-{6:D4}.0000-{7:D3}{8:D4}",
+        $Mpc,
+        $Group % 100000,
+        [int]([Math]::Floor($Serial / 1000000) % 1000),
+        [int]($Serial % 1000000),
+        $licenseType,
+        [PkeyNative]::GetSystemDefaultLangID(),
+        [Environment]::OSVersion.Version.Build,
+        $now.DayOfYear,
+        $now.Year
+    )
+}
+
+        [void]$dataGridView.Rows.Add("PID2", (& $GetPid2 $data.Group $data.Serial $data.EulaType))
+        [void]$dataGridView.Rows.Add("ExtendedPid", (& $GetExtendedPid $data.Group $data.Serial $data.EulaType))
  
         $status1, $status2 = $null, $null
         try {
