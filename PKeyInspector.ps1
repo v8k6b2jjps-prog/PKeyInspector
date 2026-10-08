@@ -1453,12 +1453,12 @@ public static class PkeyNative
 
     [DllImport(
         "PkeyLib.dll",
-        EntryPoint = "VerifyAndExtractKeyByRef",
+        EntryPoint = "VerifyKey",
         CallingConvention = CallingConvention.Cdecl,
         ExactSpelling = true,
         SetLastError = false)]
     [return: MarshalAs(UnmanagedType.I1)]
-    public static extern bool VerifyAndExtractKeyByRef(
+    public static extern bool VerifyKey(
         [MarshalAs(UnmanagedType.LPStr)] string key,
         [MarshalAs(UnmanagedType.LPStr)] string config,
         [Out] byte[] uid,
@@ -21497,7 +21497,7 @@ function DecodeForm {
         param([string]$Key, [string]$ConfigPath)
         $group = 0
         $uidBytes = [byte[]]::new(8)
-        if ([PkeyNative]::VerifyAndExtractKeyByRef($Key, $ConfigPath, $uidBytes, [ref]$group)) {
+        if ([PkeyNative]::VerifyKey($Key, $ConfigPath, $uidBytes, [ref]$group)) {
             return @{ Uid = $uidBytes; Group = $group }
         }
         return $null
@@ -21646,7 +21646,16 @@ $GetExtendedPid = {
         if ($isFileValid) { $files += $configPath }
         if ($isFolderValid) {
             $files += @(Get-ChildItem -LiteralPath $configFolder -Filter '*.xrm-ms' -Recurse -File -ErrorAction SilentlyContinue |
-                        ForEach-Object { $_.FullName })
+                Sort-Object -Descending -Property @{ Expression = {
+                        $key = [long]-1
+                        foreach ($part in $_.DirectoryName.Split('\')) {
+                            if ($part -match '^(\d+)(?:\.(\d+))?') {
+                                $key = [long]$Matches[1] * 1000000 + [long]('0' + $Matches[2])
+                            }
+                        }
+                        $key
+                    } }, FullName |
+                ForEach-Object { $_.FullName })
         }
  
         # ---- 3. Run ----------------------------------------------------------
