@@ -4078,8 +4078,6 @@ if (!([PSTypeName]'HwidGetCurrentEx.HWID').Type) {
   }
 }
 
-[HwidGetCurrentEx.HWID]
-
 # Get Minimal Privileges To Load Some NtDll function
 $PrivilegeList = @("SeDebugPrivilege", "SeImpersonatePrivilege", "SeIncreaseQuotaPrivilege", "SeAssignPrimaryTokenPrivilege", "SeSystemEnvironmentPrivilege")
 Adjust-TokenPrivileges -Privilege $PrivilegeList -Log -SysCall
@@ -8020,12 +8018,138 @@ Get-PKeyData -key $PKey -configPath $PKeyConfig -AsObject
 #Write-Host
 #Call-WebService -requestType 1 -installationId $IID
 #>
+if (-not $Global:PidDll) {
+  $Global:PidDll = 'pidgenx.dll'
+}
 function Get-PidGenX {
     param (
         [string]$key,
         [string]$configPath,
-        [switch]$AsObject
+        [switch]$AsObject,
+        [switch]$OutSec,
+        [string]$DllPath = $Global:PidDll
     )
+    $NewRva = $false
+    $validDll = (-not [string]::IsNullOrEmpty($DllPath)) -and 
+            ($DllPath -match '^pidgenx.*\.dll$') -and 
+            [File]::Exists((Join-Path $env:windir "system32\$DllPath"))
+    if ($validDll -and $Global:PidDll -ne $DllPath) {
+        $NewRva = $true
+        $Global:PidDll = $DllPath
+        $func = @(
+            @{
+                Name       = "PidGenX"
+                Dll        = $DllPath
+                ReturnType = [int]
+                Parameters = [Type[]]@([string], [string], [string], [int], [IntPtr], [IntPtr], [IntPtr])
+            },
+            @{
+                Name       = "PidGenX2"
+                Dll        = $DllPath
+                ReturnType = [int]
+                Parameters = [Type[]]@([string], [string], [string], [int], [int], [IntPtr], [IntPtr], [IntPtr])
+            },
+            @{
+                Name       = "GetPKeyData"
+                Dll        = $DllPath
+                ReturnType = [int]
+                Parameters = [Type[]]@([String], [String], [IntPtr], [IntPtr], [Int64], [string].MakeByRefType(), [string].MakeByRefType(), [string].MakeByRefType(), [string].MakeByRefType(), [IntPtr])
+            }
+        )
+        $Global:PIDGENX = Register-NativeMethods $func -ImplAttributes ([MethodImplAttributes]::IL)      
+    }
+
+# MemPatch, PatchFinder Helpers
+# To Allow extract Security value
+# Instead Raw Key, 16 byte's, 
+#   --> Write Security value
+
+# It can help in case of pKey2005 Algo' Cd-Key
+# Less relevent for pKey2009 Algo' Cd-Key
+# Which is All in same Struct, No need to solve Curve's
+
+# Alternative way, call Other Export API, and decode Serial,
+# that work much better, Compare to patch Dll in live memory
+
+#region Helpers
+    if (!([PSTypeName]'MemPatch').Type) {
+$hex = -join@(
+    '1F8B08007650E06A02FFB553C16ED43010BDE72B467B4A441415A83850F550A0824A6C597529'
+    '48200EDE78422C2676644FBABB54FD772689B32C6541F4802F89C79EF7DEBC9774C1D8AFB0DC'
+    '06C6E624E9F676C55567D934585C5846EFDA25FA1B5362384992B65B912921B0627994A44280'
+    '39360BC5659DDC2620EBF32BA28BA6759ED3D937F416E9E9934213CD725822BF5581CFBD771E'
+    '4E817D87D997A12902E246082DAC9C23F8603C778A16DE31969C8A96057BA0F64C6B8F21E470'
+    '1D4B7ABD34DF311F70FAD519CB50D125AE636F0EAEE3B14C6D45EF48C7834C267AB8E41C5ED6'
+    'CACB81ECE35B716D4DE9F4E169A2CCD7C873A73BC237CA6AC234B0EF2DA776AC5EAA06273DBF'
+    'BA3CB871D6B6B49D7A445A7F3D877E2457550165C6D596116E1489A703C8EDCE9028A01E8944'
+    'F57D29114FE8A7165341BABB7F1A118A4FF23564E0913B19AB5214300ADE6351128F50585CC7'
+    'CA8453BC775278769C66F0288ADE231CD271A47F56EEE5DFE3E690C6D0B3C7391C6D8E8FC668'
+    'A56F0F6AAE7CA815151FBD617C21AEC4DED19B071008EC21FC38FF4473854AEF58B2DEAD8168'
+    'BC7F7730D03EA9BEED2F79FEDF0C7777FAC5B577EB21B0F34D892D1B67D359ECB34EFE19A734'
+    'EAE73093DC7E67F9931BFFF60164934D773F0087D8F5388F040000'
+)
+$bytes = [byte[]]::new($hex.Length / 2)
+for ($i = 0; $i -lt $bytes.Length; $i++) {
+    $bytes[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16)
+}
+$ms = [IO.MemoryStream]::new($bytes)
+$gs = [IO.Compression.GZipStream]::new($ms, [IO.Compression.CompressionMode]::Decompress)
+$sr = [IO.StreamReader]::new($gs)
+Add-Type -TypeDefinition ($sr.ReadToEnd())
+$sr.Dispose(); $gs.Dispose(); $ms.Dispose()
+}
+    if (!([PSTypeName]'PatchFinder').Type) {
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class PatchFinder
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr GetModuleHandle(string n);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr LoadLibrary(string n);
+    public static int FindDisplacementRVA(string dllNameOrPath)
+    {
+        IntPtr hMod = GetModuleHandle(dllNameOrPath);
+        if (hMod == IntPtr.Zero) hMod = LoadLibrary(dllNameOrPath);
+        if (hMod == IntPtr.Zero) return -1;
+        int e_lfanew = Marshal.ReadInt32(hMod, 0x3C);
+        int coffOff = e_lfanew + 4;
+        short numSections = Marshal.ReadInt16(hMod, coffOff + 2);
+        short optSize = Marshal.ReadInt16(hMod, coffOff + 16);
+        int sectOff = coffOff + 20 + optSize;
+        int textRVA = 0, textSize = 0;
+        for (int i = 0; i < numSections; i++)
+        {
+            int off = sectOff + i * 40;
+            long nameVal = Marshal.ReadInt64(hMod, off);
+            if ((nameVal & 0x000000FFFFFFFFFF) == 0x000000747865742E)
+            { textSize = Marshal.ReadInt32(hMod, off + 8); textRVA = Marshal.ReadInt32(hMod, off + 12); break; }
+        }
+        if (textRVA == 0) return -1;
+        byte[] text = new byte[textSize];
+        Marshal.Copy(new IntPtr(hMod.ToInt64() + textRVA), text, 0, textSize);
+        byte[] sp = { 0xF3, 0x0F, 0x7F, 0x87, 0x28, 0x03, 0x00, 0x00 };
+        for (int pos = 0; pos <= textSize - 8; pos++)
+        {
+            bool m = true;
+            for (int j = 0; j < 8; j++) { if (text[pos+j] != sp[j]) { m = false; break; } }
+            if (!m) continue;
+            int ss = Math.Max(0, pos - 32);
+            for (int k = pos - 4; k >= ss; k--)
+            {
+                if (text[k]==0x0F && text[k+1]==0x10 && text[k+2]==0x46 && text[k+3]==0x58)
+                    return textRVA + k + 3;
+                if (k >= 1 && text[k-1]==0x41 && text[k]==0x0F && text[k+1]==0x10 && text[k+2]==0x46 && text[k+3]==0x58)
+                    return textRVA + k + 3;
+            }
+        }
+        return -1;
+    }
+}
+"@
+}
+#endregion
 
     try {
         # Validate input
@@ -8036,7 +8160,7 @@ function Get-PidGenX {
         <#
         sppcomapi.dll
         __int64 __fastcall GetWindowsPKeyInfo(_WORD *a1, __int64 a2, __int64 a3, __int64 a4)
-        { 
+        {
             __int128 v46[3]; // __m128 v46[3], 48 bytes total
             int v47[44];
             int v48[320];
@@ -8053,9 +8177,36 @@ function Get-PidGenX {
         $DPIDPtr  = New-IntPtr -Size 0xB0  -InitialValue 0xA4
         $DPID4Ptr = New-IntPtr -Size 0x500 -InitialValue 0x4F8
 
-        try {
+        if ($OutSec) {
             try {
-                # Call the function with appropriate parameters
+                
+              # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Patch ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ .!
+
+                Ldr-LoadDll -dwFlags SEARCH_SYS32 -dll $PidDll | Out-Null
+                if ($NewRva) {
+                  $Global:patchRVA = $null
+                }
+                if (-not $Global:patchRVA) {
+                  $Global:patchRVA = [PatchFinder]::FindDisplacementRVA($PidDll)
+                }
+                if ($patchRVA -eq -1) { 
+                    throw "Patch pattern not found in $PidDll" 
+                }
+
+                # Apply in-memory patch: movups displacement 0x58 -> 0x48
+                # Redirects source from RawKeyMaterial to Security field
+                [MemPatch]::Apply($PidDll, $patchRVA, 0x48) | Out-Null
+
+              # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Patch ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ .!
+
+            } catch {
+                $OutSec = $false
+            }
+        }
+
+        try {
+
+            try {
                 $result = $Global:PIDGENX::PidGenX2(
                     # Most important Roles
                     $key, $configPath,
@@ -8103,15 +8254,6 @@ function Get-PidGenX {
                 throw "HRESULT: $ErrorText ($HResultHex)"
             }
 
-            $offsets = @{
-                AdvancedPid    = 8     # 128/2
-                ActivationId   = 136   # 128/2
-                EditionType    = 280   # 520/2
-                EditionId      = 888   # 128/2
-                KeyType        = 1016  # 128/2
-                EULA           = 1144  # 128/2
-            }
-
             function Read-WCHARArray {
                 param (
                     [IntPtr]$ptr,
@@ -8122,86 +8264,93 @@ function Get-PidGenX {
                 return [Encoding]::Unicode.GetString($bytes).TrimEnd([char]0)
             }
 
-            $results = @()
+            #  DPID4 String Fields 
+            $AdvancedPid  = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr,    8)) 64
+            $ActivationId = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr,  136)) 64
+            $EditionType  = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr,  280)) 260
+            $EditionId    = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr,  888)) 64
+            $KeyType      = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr, 1016)) 64
+            $EULA         = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr, 1144)) 64
 
-            # Extract KeyGroup value from DigitalProductId3
-            $keyGroupOffset = 32
-            $keyGroup = [UInt32][Marshal]::ReadInt32([IntPtr]::Add($DPIDPtr, $keyGroupOffset))
+            $Security = -1L
+            if ($OutSec) {
+              #  DPID4 Binary Fields 
+              # +0x328: Security” dynamically patched movups displacement
+              $Security = [Marshal]::ReadInt64([IntPtr]::Add($DPID4Ptr, 0x328))
+            }
 
-            if ($keyGroup) {
-                
-                #V2
-				try {
-                    $ProductDescription = $KeysText[[INT]$keyGroup]
-                }
+            #  DPID3 Fields 
+            $Group = [UInt32][Marshal]::ReadInt32([IntPtr]::Add($DPIDPtr, 0x20))
+
+            #  Serial from AdvancedPid 
+            # Format: "XXXXX-XXX-SSSSSSS-SSSSS"
+            $pidParts = $AdvancedPid.Split('-')
+            $SerialA  = [int]$pidParts[2]
+            $SerialB  = [int]$pidParts[3]
+            $Serial   = ($SerialA * 1000000) + $SerialB
+
+            #  PID String 
+            $pidString = [Marshal]::PtrToStringUni($PIDPtr, 0x30 / 2)
+
+            #  Product Description 
+            $ProductDescription = $null
+            if ($Group) {
+                try   { $ProductDescription = $KeysText[[int]$Group] }
                 catch {}
 
-                
-                #V1
                 if (-not $ProductDescription) {
-                  $list = GenerateConfigList -pkeyconfig $configPath -SkipKey $true -SkipKeyRange $true
-                  $data = $list | ? RefGroupId -eq $keyGroup
-                  if ($data -and (-not [STRING]::IsNullOrWhiteSpace($data.ProductDescription))) {
-                    $ProductDescription = $data.ProductDescription
-            }}}
-
-            $pidString = [marshal]::PtrToStringUni($pidPtr, 0x30/2)
-            foreach ($key in $offsets.Keys) {
-                $offset = $offsets[$key]
-                $size = if ($key -eq "EditionType") { (520/2) } else { (128/2) }
-                $value = if ($key -eq "IsUpgrade") { [Marshal]::ReadByte([IntPtr]::Add($DPID4Ptr, $offset)) } else { Read-WCHARArray ([IntPtr]::Add($DPID4Ptr, $offset)) $size }
-                
-				switch ($key) 
-                {
-                  'EULA'         {$EULA=$value}
-				  'KeyType'      {$KeyType=$value}
-				  'EditionId'    {$EditionId=$value}
-				  'AdvancedPid'  {$AdvancedPid=$value}
-                  'EditionType'  {$EditionType=$value}
-				  'ActivationId' {$ActivationId=$value}
+                    try {
+                      $list = GenerateConfigList -pkeyconfig $configPath -SkipKey $true -SkipKeyRange $true
+                      $data = $list | ? RefGroupId -eq $Group
+                      if ($data -and (-not [string]::IsNullOrWhiteSpace($data.ProductDescription))) {
+                        $ProductDescription = $data.ProductDescription
+                      }
+                    } catch {}
                 }
             }
 
+            #  Output 
             if ($AsObject) {
-                return (
-                    [PSObject]@{
-                        EditionType = $EditionType
-                        EditionId = $EditionId
-                        KeyType = $KeyType
-                        ProductID = $pidString
-                        ActivationId = $ActivationId
-                        AdvancedPid = $AdvancedPid
-                        Description = $ProductDescription
-                    }
-                )
+                return ([PSObject][Ordered]@{
+                    Group        = $Group
+                    Serial       = $Serial
+                    Security     = $Security
+                    EditionType  = $EditionType
+                    EditionId    = $EditionId
+                    KeyType      = $KeyType
+                    ProductID    = $pidString
+                    ActivationId = $ActivationId
+                    AdvancedPid  = $AdvancedPid
+                    Description  = $ProductDescription
+                })
             } else {
-              # $results += @{ Property = "KeyGroup"; Value = $keyGroup }
-                $results += @{ Property = "EditionType"; Value = $EditionType }
-                $results += @{ Property = "EditionId"; Value = $EditionId }
-                $results += @{ Property = "KeyType"; Value = $KeyType }
-                $results += @{ Property = "ProductID"; Value = $pidString }
-                $results += @{ Property = "ActivationId"; Value = $ActivationId }
-                $results += @{ Property = "AdvancedPid"; Value = $AdvancedPid }
-                $results += @{ Property = "Description"; Value = $ProductDescription }
-                return $results
+                return @(
+                    @{ Property = "Group";        Value = $Group }
+                    @{ Property = "Serial";       Value = $Serial }
+                    @{ Property = "Security";     Value = $Security }
+                    @{ Property = "EditionType";  Value = $EditionType }
+                    @{ Property = "EditionId";    Value = $EditionId }
+                    @{ Property = "KeyType";      Value = $KeyType }
+                    @{ Property = "ProductID";    Value = $pidString }
+                    @{ Property = "ActivationId"; Value = $ActivationId }
+                    @{ Property = "AdvancedPid";  Value = $AdvancedPid }
+                    @{ Property = "Description";  Value = $ProductDescription }
+                )
             }
 
         } finally {
             [Marshal]::FreeHGlobal($PIDPtr)
             [Marshal]::FreeHGlobal($DPIDPtr)
             [Marshal]::FreeHGlobal($DPID4Ptr)
+
+            # Revert in-memory patch
+            [MemPatch]::Apply($PidDll, $patchRVA, 0x58) | Out-Null
         }
     } catch {
         if ($AsObject) {
-            return (
-                [PSObject]@{
-                    Error = "$($_.Exception.Message)"
-                }
-            )
+            return ([PSObject]@{ Error = "$($_.Exception.Message)" })
         } else {
-            return (
-                @{ Property = "Error"; Value = "$($_.Exception.Message)" }
-            )
+            return @{ Property = "Error"; Value = "$($_.Exception.Message)" }
         }
     }
 }
