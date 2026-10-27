@@ -8027,13 +8027,20 @@ function Get-PidGenX {
         [string]$configPath,
         [switch]$AsObject,
         [switch]$Extra = $true,
+        [switch]$AutoDetect = $false,
         [string]$DllPath = $Global:PidDll
     )
 
+    # Get-PidGenX -key RHGJR-N7FVY-Q3B8F-KBQ6V-46YP4 `
+    # -configPath C:\Windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms `
+    # -AsObject -DllPath pidgenxIn.dll -Extra -AutoDetect
+
     $NewRva   = $false
-    $algo2005 = $key -notmatch 'N'
-    $validDll = (-not [string]::IsNullOrEmpty($DllPath)) -and 
-            ($DllPath -match '^pidgenx.*\.dll$') -and 
+    $legacy   = $false;
+    $algo2005 = $false
+    $algo2009 = $key -match 'N'
+    $validDll = (-not [string]::IsNullOrEmpty($DllPath)) -and
+            ($DllPath -match '^pidgenx.*\.dll$') -and
             [File]::Exists((Join-Path $env:windir "system32\$DllPath"))
     if ($validDll -and $Global:PidDll -ne $DllPath) {
         $NewRva = $true
@@ -8058,20 +8065,15 @@ function Get-PidGenX {
                 Parameters = [Type[]]@([String], [String], [IntPtr], [IntPtr], [Int64], [string].MakeByRefType(), [string].MakeByRefType(), [string].MakeByRefType(), [string].MakeByRefType(), [IntPtr])
             }
         )
-        $Global:PIDGENX = Register-NativeMethods $func -ImplAttributes ([MethodImplAttributes]::IL)      
+        $Global:PIDGENX = Register-NativeMethods $func -ImplAttributes ([MethodImplAttributes]::IL)
     }
 
 # MemPatch, PatchFinder Helpers
-# To Allow extract Security value
-# Instead Raw Key, 16 byte's, 
-#   --> Write Security value
-
-# It can help in case of pKey2005 Algo' Cd-Key
-# Less relevent for pKey2009 Algo' Cd-Key
-# Which is All in same Struct, No need to solve Curve's
-
-# Alternative way, call Other Export API, and decode Serial,
-# that work much better, Compare to patch Dll in live memory
+# Flip the read-source of the two raw-key movups copies to surface internal PID_OBJ fields:
+#   DPID4 m_abCdKey (DPID4Ptr+0x328)  <- [r14+0x58] RawKeyMaterial  -> flip to 0x68 = DecodedM/ActData
+#   DPID3 m_abCdKey (DPIDPtr +0x34 )  <- [rsi+0x58] RawKeyMaterial  -> flip to 0x28 = Algorithm GUID
+# Read-only extraction; both reverted in finally. pkey2005 path is the one that needs it.
+# Alternative: call the export and decode Serial from AdvancedPid (no patch).
 
 #region Helpers
     if (!([PSTypeName]'MemPatch').Type) {
@@ -8110,7 +8112,11 @@ public static class PatchFinder
     static extern IntPtr GetModuleHandle(string n);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr LoadLibrary(string n);
-    public static int FindDisplacementRVA(string dllNameOrPath)
+
+    // Generic: locate 'anchor' (a movdqu-store signature) in .text, then scan back <=32 bytes
+    // for the paired raw-key movups load ( [rsi+0x58] = 0F 10 46 58, or [r14+0x58] = 41 0F 10 46 58 )
+    // and return the RVA of its disp8 byte (the 0x58 to flip).
+    public static int FindDispRVA(string dllNameOrPath, byte[] anchor)
     {
         IntPtr hMod = GetModuleHandle(dllNameOrPath);
         if (hMod == IntPtr.Zero) hMod = LoadLibrary(dllNameOrPath);
@@ -8131,11 +8137,10 @@ public static class PatchFinder
         if (textRVA == 0) return -1;
         byte[] text = new byte[textSize];
         Marshal.Copy(new IntPtr(hMod.ToInt64() + textRVA), text, 0, textSize);
-        byte[] sp = { 0xF3, 0x0F, 0x7F, 0x87, 0x28, 0x03, 0x00, 0x00 };
-        for (int pos = 0; pos <= textSize - 8; pos++)
+        for (int pos = 0; pos <= textSize - anchor.Length; pos++)
         {
             bool m = true;
-            for (int j = 0; j < 8; j++) { if (text[pos+j] != sp[j]) { m = false; break; } }
+            for (int j = 0; j < anchor.Length; j++) { if (text[pos+j] != anchor[j]) { m = false; break; } }
             if (!m) continue;
             int ss = Math.Max(0, pos - 32);
             for (int k = pos - 4; k >= ss; k--)
@@ -8147,6 +8152,12 @@ public static class PatchFinder
             }
         }
         return -1;
+    }
+
+    // Back-compat: the original DPID4 (m_abCdKey @ +0x328 / M-ActData) finder.
+    public static int FindDisplacementRVA(string dllNameOrPath)
+    {
+        return FindDispRVA(dllNameOrPath, new byte[] { 0xF3,0x0F,0x7F,0x87,0x28,0x03,0x00,0x00 });
     }
 }
 "@
@@ -8179,29 +8190,39 @@ public static class PatchFinder
         $DPIDPtr  = New-IntPtr -Size 0xB0  -InitialValue 0xA4
         $DPID4Ptr = New-IntPtr -Size 0x500 -InitialValue 0x4F8
 
-        # FIX 1: track whether we actually applied the patch this call
-        $patched = $false
+        # Track which patches we actually applied this call (revert only those)
+        $mPatch    = $false   # DPID4 slot (M/ActData)
+        $guidPatch = $false   # DPID3 slot (Algorithm GUID)
 
         if ($Extra) {
             try {
-                
+
               # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Patch ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ .!
 
                 Ldr-LoadDll -dwFlags SEARCH_SYS32 -dll $PidDll | Out-Null
                 if ($NewRva) {
-                  $Global:patchRVA = $null
+                  $Global:patchRVA     = $null
+                  $Global:patchRVAGuid = $null
                 }
                 if (-not $Global:patchRVA) {
-                  $Global:patchRVA = [PatchFinder]::FindDisplacementRVA($PidDll)
+                  $Global:patchRVA     = [PatchFinder]::FindDispRVA($PidDll, [byte[]](0xF3,0x0F,0x7F,0x87,0x28,0x03,0x00,0x00))
                 }
-                if ($patchRVA -eq -1) { 
-                    throw "Patch pattern not found in $PidDll" 
+                if (-not $Global:patchRVAGuid) {
+                  $Global:patchRVAGuid = [PatchFinder]::FindDispRVA($PidDll, [byte[]](0xF3,0x0F,0x7F,0x47,0x34))
+                }
+                if ($patchRVA -eq -1) {
+                    throw "M/ActData patch pattern not found in $PidDll"
                 }
 
-                # Apply in-memory patch: movups displacement 0x58 -> 0x68 // not Just Sec, 0x48, the Big Unien Act
-                # Redirects source from RawKeyMaterial to DecodedM/ActData field
+                # DPID4 m_abCdKey (DPID4Ptr+0x328): 0x58 -> 0x68  = DecodedM / ActData (the big union)
                 [MemPatch]::Apply($PidDll, $patchRVA, 0x68) | Out-Null
-                $patched = $true
+                $mPatch = $true
+
+                # DPID3 m_abCdKey (DPIDPtr+0x34): 0x58 -> 0x28  = Algorithm GUID (authoritative 2005/2009)
+                if ($AutoDetect.IsPresent -and $patchRVAGuid -ne -1) {
+                    [MemPatch]::Apply($PidDll, $patchRVAGuid, 0x28) | Out-Null
+                    $guidPatch = $true
+                }
 
               # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Patch ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ .!
 
@@ -8213,7 +8234,7 @@ public static class PatchFinder
         try {
 
             try {
-                $result = $Global:PIDGENX::PidGenX2(
+                $hr = $Global:PIDGENX::PidGenX2(
                     # Most important Roles
                     $key, $configPath,
                     # Default value for MSPID, 03612 ?? 00000 ?
@@ -8254,7 +8275,7 @@ public static class PatchFinder
                 return [Encoding]::Unicode.GetString($bytes).TrimEnd([char]0)
             }
 
-            #  DPID4 String Fields 
+            #  DPID4 String Fields
             $AdvancedPid  = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr,    8)) 64
             $ActivationId = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr,  136)) 64
             $EditionType  = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr,  280)) 260
@@ -8265,50 +8286,71 @@ public static class PatchFinder
             $Group    = -1L
             $Serial   = -1L
             $Security = -1L
+            $upgrade  = -1
             $ActData  = ''
+            $AlgoGuid = [Guid]::Empty
 
             if ($Extra) {
 
-                # DPID4+0x328 now holds the full 16-byte union
+                # --- DPID3 m_abCdKey (+0x34): Algorithm GUID -> authoritative algorithm ---
+                if ($guidPatch) {
+                    $g = [byte[]]::new(16)
+                    [Marshal]::Copy([IntPtr]::Add($DPIDPtr, 0x34), $g, 0, 16)
+                    $AlgoGuid = [Guid]::new($g)
+                    switch ($AlgoGuid) {
+                        # modern -> parse the +0x68 union (M / ActData)
+                        ([Guid]'B8731595-A2F6-430B-A799-FBFFB81A8D73') { $algo2005=$true; }
+                        ([Guid]'660672EF-7809-4CFD-8D54-41B7FB738988') { $algo2009=$true; }
+
+                        # legacy -> NO union, NO Security: Group/Serial/Upgrade from the standard fields
+                        ([Guid]'35BFEDB3-9131-4F58-9D9A-5B32D10F50E0') { $legacy=$true; }
+                        ([Guid]'9F44BF99-4976-4BFD-B00A-A8AEFBA45484') { $legacy=$true; }
+                        ([Guid]'2B864AA3-A736-4D50-8604-EBB3BD7D7C61') { $legacy=$true; }
+                        # unknown GUID -> keep the N-heuristic
+                    }
+                }
+
+                # --- DPID4 m_abCdKey (+0x328): the 16-byte union (DecodedM / ActData) ---
                 $slot = [byte[]]::new(16)
                 [Marshal]::Copy([IntPtr]::Add($DPID4Ptr,0x328), $slot, 0, 16)
 
-                if ($algo2005) {
+                if ($algo2009) {
 
-                    # Pkey2005 Format
-                    $M = [BitConverter]::ToInt64($slot, 0)                       # low 8 bytes = M (51 bits used)
-                    $ActData = [BitConverter]::ToString($slot, 0, 8)             # M occupies up to 8 bytes (51 bits)
-                    $upgrade  =  $M -band 1
-                    if ($Serial -eq -1L) {
-                      $serial   = ($M -shr 1 ) -band 0x3FFFFFFF                  # 30b
-                    }
-                    $security = ($M -shr 31) -band 0xFFFFF                       # 20b
-                
-                } else {
-                    
-                    # pkey2009 — 104-bit record across 13 bytes
+                    # pkey2009 : 104-bit record across 13 bytes
+                    #            upgrade | serial<<1 | group<<31 | security<<51
                     $u = [byte[]]::new(14)
-                    [Array]::Copy($slot, 0, $u, 0, 13)                           # 13 data bytes + 1 zero => guaranteed unsigned
+                    [Array]::Copy($slot, 0, $u, 0, 13)                           # 13 data bytes + 1 zero => unsigned
                     $act = [System.Numerics.BigInteger]::new($u)
-                    $ActData = [BitConverter]::ToString($slot, 0, 13)            # ActData is 13 bytes (104 bits)
-                    $upgrade  =  $act -band 1
-                    if ($Serial -eq -1L) {
-                      $serial   = [long](($act -shr 1 ) -band ((1L -shl 30)-1))  # 30b
-                    }
-                    if ($group -eq -1L) {
-                      $group = [long](($act -shr 31) -band ((1L -shl 20)-1))     # 20b
-                    }
+                    $ActData = [BitConverter]::ToString($slot, 0, 13)            # ActData is 13 bytes
+                    $upgrade  =  [int]($act -band 1)
+                    $serial   = [long](($act -shr 1 ) -band ((1L -shl 30)-1))    # 30b
+                    $group    = [long](($act -shr 31) -band ((1L -shl 20)-1))    # 20b
                     $security = [long](($act -shr 51) -band ((1L -shl 53)-1))    # 53b
+
+                } elseif ($algo2005 -or (!$AlgoGuid -and !$legacy -and !$algo2005 -and !$algo2009)) {
+
+                    # Pkey2005 Format : M = upgrade | serial<<1 | security<<31  (51 bits)
+                    $M = [BitConverter]::ToInt64($slot, 0)                       # low 8 bytes = M
+                    $ActData = [BitConverter]::ToString($slot, 0, 8)             # M occupies up to 8 bytes
+                    $upgrade  =  [int]($M -band 1)
+                    $serial   = ($M -shr 1 ) -band 0x3FFFFFFF                    # 30b
+                    $security = ($M -shr 31) -band 0xFFFFF                       # 20b
+
+                } elseif($legacy) {
+                    $upgrade  = [int][Marshal]::ReadByte([IntPtr]::Add($DPID4Ptr, 0x320))  # m_isUpgrade (native)
+                    $Security = $null     # legacy has none
+                    $ActData  = ''
+                    # Group(+0x20) and Serial(AdvancedPid) come from the fallbacks
                 }
             }
 
             if ($group -eq -1L) {
-                #  DPID3 Fields
+                #  DPID3 m_keyIdx (+0x20) = Group
                 $Group = [UInt32][Marshal]::ReadInt32([IntPtr]::Add($DPIDPtr, 0x20))
             }
 
             if ($Serial -eq -1L) {
-                #  Serial from AdvancedPid 
+                #  Serial from AdvancedPid
                 # Format: "XXXXX-XXX-SSSSSSS-SSSSS"
                 $pidParts = $AdvancedPid.Split('-')
                 $SerialA  = [int]$pidParts[2]
@@ -8316,10 +8358,10 @@ public static class PatchFinder
                 $Serial   = ($SerialA * 1000000) + $SerialB
             }
 
-            #  PID String 
+            #  PID String
             $pidString = [Marshal]::PtrToStringUni($PIDPtr, 0x30 / 2)
 
-            #  Product Description 
+            #  Product Description
             $ProductDescription = $null
             if ($Group) {
                 try   { $ProductDescription = $KeysText[[int]$Group] }
@@ -8336,12 +8378,15 @@ public static class PatchFinder
                 }
             }
 
-            #  Output 
+            #  Output
             if ($AsObject) {
                 return ([PSObject][Ordered]@{
                     Group        = $Group
                     Serial       = $Serial
                     Security     = $Security
+                    Upgrade      = $upgrade
+                    Algo         = $(if ($algo2005) {'pkey2005'} else {'pkey2009'})
+                    AlgoGuid     = $AlgoGuid
                     EditionType  = $EditionType
                     EditionId    = $EditionId
                     KeyType      = $KeyType
@@ -8356,6 +8401,9 @@ public static class PatchFinder
                     @{ Property = "Group";        Value = $Group }
                     @{ Property = "Serial";       Value = $Serial }
                     @{ Property = "Security";     Value = $Security }
+                    @{ Property = "Upgrade";      Value = $upgrade }
+                    @{ Property = "Algo";         Value = $(if ($algo2005) {'pkey2005'} else {'pkey2009'}) }
+                    @{ Property = "AlgoGuid";     Value = $AlgoGuid }
                     @{ Property = "EditionType";  Value = $EditionType }
                     @{ Property = "EditionId";    Value = $EditionId }
                     @{ Property = "KeyType";      Value = $KeyType }
@@ -8372,10 +8420,9 @@ public static class PatchFinder
             [Marshal]::FreeHGlobal($DPIDPtr)
             [Marshal]::FreeHGlobal($DPID4Ptr)
 
-            # FIX 2: only revert if we actually patched this call
-            if ($patched) {
-                [MemPatch]::Apply($PidDll, $patchRVA, 0x58) | Out-Null
-            }
+            # Revert only the patches we applied this call
+            if ($mPatch)    { [MemPatch]::Apply($PidDll, $patchRVA,     0x58) | Out-Null }
+            if ($guidPatch) { [MemPatch]::Apply($PidDll, $patchRVAGuid, 0x58) | Out-Null }
         }
     } catch {
         if ($AsObject) {
