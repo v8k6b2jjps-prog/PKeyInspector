@@ -8031,9 +8031,20 @@ function Get-PidGenX {
         [string]$DllPath = $Global:PidDll
     )
 
-    # Get-PidGenX -key RHGJR-N7FVY-Q3B8F-KBQ6V-46YP4 `
-    # -configPath C:\Windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms `
-    # -AsObject -DllPath pidgenxIn.dll -Extra -AutoDetect
+    <#
+    Clear-Host
+    Write-Host
+
+    Get-PidGenX -key RHGJR-N7FVY-Q3B8F-KBQ6V-46YP4 `
+     -configPath C:\Windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms `
+     -AsObject -DllPath pidgenxIn.dll -Extra #-AutoDetect
+    Write-Host
+
+    Get-PidGenX -key MKKRJ-CBYG7-MK2Y4-DXHT6-8VCJB `
+     -configPath C:\Windows\System32\spp\tokens\pkeyconfig\pkeyconfig-downlevel.xrm-ms `
+     -AsObject -DllPath pidgenxIn.dll -Extra #-AutoDetect
+    Write-Host
+    #>
 
     $NewRva   = $false
     $legacy   = $false;
@@ -8289,6 +8300,7 @@ public static class PatchFinder
             $upgrade  = -1
             $ActData  = ''
             $AlgoGuid = [Guid]::Empty
+            $AlgoName = ''
 
             if ($Extra) {
 
@@ -8299,15 +8311,20 @@ public static class PatchFinder
                     $AlgoGuid = [Guid]::new($g)
                     switch ($AlgoGuid) {
                         # modern -> parse the +0x68 union (M / ActData)
-                        ([Guid]'B8731595-A2F6-430B-A799-FBFFB81A8D73') { $algo2005=$true; }
-                        ([Guid]'660672EF-7809-4CFD-8D54-41B7FB738988') { $algo2009=$true; }
+                        ([Guid]'B8731595-A2F6-430B-A799-FBFFB81A8D73') { $algo2005=$true; $AlgoName = 'pkey2005' }
+                        ([Guid]'660672EF-7809-4CFD-8D54-41B7FB738988') { $algo2009=$true; $AlgoName = 'pkey2009' }
 
                         # legacy -> NO union, NO Security: Group/Serial/Upgrade from the standard fields
-                        ([Guid]'35BFEDB3-9131-4F58-9D9A-5B32D10F50E0') { $legacy=$true; }
-                        ([Guid]'9F44BF99-4976-4BFD-B00A-A8AEFBA45484') { $legacy=$true; }
-                        ([Guid]'2B864AA3-A736-4D50-8604-EBB3BD7D7C61') { $legacy=$true; }
+                        ([Guid]'35BFEDB3-9131-4F58-9D9A-5B32D10F50E0') { $legacy=$true; $AlgoName   = 'pkey980'  }
+                        ([Guid]'9F44BF99-4976-4BFD-B00A-A8AEFBA45484') { $legacy=$true; $AlgoName   = 'pkey985'  }
+                        ([Guid]'2B864AA3-A736-4D50-8604-EBB3BD7D7C61') { $legacy=$true; $AlgoName   = 'pkey986'  }
                         # unknown GUID -> keep the N-heuristic
                     }
+                }
+
+                if ($algo2009) {
+                  $AlgoName = 'pkey2009'
+                  $AlgoGuid = [Guid]'660672EF-7809-4CFD-8D54-41B7FB738988'
                 }
 
                 # --- DPID4 m_abCdKey (+0x328): the 16-byte union (DecodedM / ActData) ---
@@ -8315,7 +8332,7 @@ public static class PatchFinder
                 [Marshal]::Copy([IntPtr]::Add($DPID4Ptr,0x328), $slot, 0, 16)
 
                 if ($algo2009) {
-
+                
                     # pkey2009 : 104-bit record across 13 bytes
                     #            upgrade | serial<<1 | group<<31 | security<<51
                     $u = [byte[]]::new(14)
@@ -8327,7 +8344,7 @@ public static class PatchFinder
                     $group    = [long](($act -shr 31) -band ((1L -shl 20)-1))    # 20b
                     $security = [long](($act -shr 51) -band ((1L -shl 53)-1))    # 53b
 
-                } elseif ($algo2005 -or (!$AlgoGuid -and !$legacy -and !$algo2005 -and !$algo2009)) {
+                } elseif ($algo2005) {
 
                     # Pkey2005 Format : M = upgrade | serial<<1 | security<<31  (51 bits)
                     $M = [BitConverter]::ToInt64($slot, 0)                       # low 8 bytes = M
@@ -8337,10 +8354,26 @@ public static class PatchFinder
                     $security = ($M -shr 31) -band 0xFFFFF                       # 20b
 
                 } elseif($legacy) {
+
                     $upgrade  = [int][Marshal]::ReadByte([IntPtr]::Add($DPID4Ptr, 0x320))  # m_isUpgrade (native)
                     $Security = $null     # legacy has none
                     $ActData  = ''
-                    # Group(+0x20) and Serial(AdvancedPid) come from the fallbacks
+
+                } else {
+                    
+                    # So, Not N key, Have M ? Or Not ..
+                    $M = [BitConverter]::ToInt64($slot, 0)                       # low 8 bytes = M
+                    if ($M -ne 0) {
+                        $ActData = [BitConverter]::ToString($slot, 0, 8)         # M occupies up to 8 bytes
+                        $upgrade  =  [int]($M -band 1)
+                        $serial   = ($M -shr 1 ) -band 0x3FFFFFFF                # 30b
+                        $security = ($M -shr 31) -band 0xFFFFF                   # 20b
+                        $AlgoName = 'pkey2005'
+                        $AlgoGuid = [Guid]'B8731595-A2F6-430B-A799-FBFFB81A8D73'
+                    } else {
+                        $AlgoName = 'Legacy'
+                        $AlgoGuid = [Guid]::Empty
+                    }
                 }
             }
 
@@ -8385,7 +8418,7 @@ public static class PatchFinder
                     Serial       = $Serial
                     Security     = $Security
                     Upgrade      = $upgrade
-                    Algo         = $(if ($algo2005) {'pkey2005'} else {'pkey2009'})
+                    AlgoName     = $AlgoName
                     AlgoGuid     = $AlgoGuid
                     EditionType  = $EditionType
                     EditionId    = $EditionId
@@ -8402,7 +8435,7 @@ public static class PatchFinder
                     @{ Property = "Serial";       Value = $Serial }
                     @{ Property = "Security";     Value = $Security }
                     @{ Property = "Upgrade";      Value = $upgrade }
-                    @{ Property = "Algo";         Value = $(if ($algo2005) {'pkey2005'} else {'pkey2009'}) }
+                    @{ Property = "AlgoName";     Value = $AlgoName }
                     @{ Property = "AlgoGuid";     Value = $AlgoGuid }
                     @{ Property = "EditionType";  Value = $EditionType }
                     @{ Property = "EditionId";    Value = $EditionId }
