@@ -8026,10 +8026,12 @@ function Get-PidGenX {
         [string]$key,
         [string]$configPath,
         [switch]$AsObject,
-        [switch]$OutSec,
+        [switch]$Extra = $true,
         [string]$DllPath = $Global:PidDll
     )
-    $NewRva = $false
+
+    $NewRva   = $false
+    $algo2005 = $key -notmatch 'N'
     $validDll = (-not [string]::IsNullOrEmpty($DllPath)) -and 
             ($DllPath -match '^pidgenx.*\.dll$') -and 
             [File]::Exists((Join-Path $env:windir "system32\$DllPath"))
@@ -8180,7 +8182,7 @@ public static class PatchFinder
         # FIX 1: track whether we actually applied the patch this call
         $patched = $false
 
-        if ($OutSec) {
+        if ($Extra) {
             try {
                 
               # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Patch ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ .!
@@ -8196,15 +8198,15 @@ public static class PatchFinder
                     throw "Patch pattern not found in $PidDll" 
                 }
 
-                # Apply in-memory patch: movups displacement 0x58 -> 0x48
-                # Redirects source from RawKeyMaterial to Security field
-                [MemPatch]::Apply($PidDll, $patchRVA, 0x48) | Out-Null
+                # Apply in-memory patch: movups displacement 0x58 -> 0x68 // not Just Sec, 0x48, the Big Unien Act
+                # Redirects source from RawKeyMaterial to DecodedM/ActData field
+                [MemPatch]::Apply($PidDll, $patchRVA, 0x68) | Out-Null
                 $patched = $true
 
               # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Patch ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ .!
 
             } catch {
-                $OutSec = $false
+                $Extra = $false
             }
         }
 
@@ -8260,22 +8262,59 @@ public static class PatchFinder
             $KeyType      = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr, 1016)) 64
             $EULA         = Read-WCHARArray ([IntPtr]::Add($DPID4Ptr, 1144)) 64
 
+            $Group    = -1L
+            $Serial   = -1L
             $Security = -1L
-            if ($OutSec) {
-              #  DPID4 Binary Fields 
-              # +0x328: Security dynamically patched movups displacement
-              $Security = [Marshal]::ReadInt64([IntPtr]::Add($DPID4Ptr, 0x328))
+            $ActData  = ''
+
+            if ($Extra) {
+
+                # DPID4+0x328 now holds the full 16-byte union
+                $slot = [byte[]]::new(16)
+                [Marshal]::Copy([IntPtr]::Add($DPID4Ptr,0x328), $slot, 0, 16)
+
+                if ($algo2005) {
+
+                    # Pkey2005 Format
+                    $M = [BitConverter]::ToInt64($slot, 0)                       # low 8 bytes = M (51 bits used)
+                    $ActData = [BitConverter]::ToString($slot, 0, 8)             # M occupies up to 8 bytes (51 bits)
+                    $upgrade  =  $M -band 1
+                    if ($Serial -eq -1L) {
+                      $serial   = ($M -shr 1 ) -band 0x3FFFFFFF                  # 30b
+                    }
+                    $security = ($M -shr 31) -band 0xFFFFF                       # 20b
+                
+                } else {
+                    
+                    # pkey2009 — 104-bit record across 13 bytes
+                    $u = [byte[]]::new(14)
+                    [Array]::Copy($slot, 0, $u, 0, 13)                           # 13 data bytes + 1 zero => guaranteed unsigned
+                    $act = [System.Numerics.BigInteger]::new($u)
+                    $ActData = [BitConverter]::ToString($slot, 0, 13)            # ActData is 13 bytes (104 bits)
+                    $upgrade  =  $act -band 1
+                    if ($Serial -eq -1L) {
+                      $serial   = [long](($act -shr 1 ) -band ((1L -shl 30)-1))  # 30b
+                    }
+                    if ($group -eq -1L) {
+                      $group = [long](($act -shr 31) -band ((1L -shl 20)-1))     # 20b
+                    }
+                    $security = [long](($act -shr 51) -band ((1L -shl 53)-1))    # 53b
+                }
             }
 
-            #  DPID3 Fields 
-            $Group = [UInt32][Marshal]::ReadInt32([IntPtr]::Add($DPIDPtr, 0x20))
+            if ($group -eq -1L) {
+                #  DPID3 Fields
+                $Group = [UInt32][Marshal]::ReadInt32([IntPtr]::Add($DPIDPtr, 0x20))
+            }
 
-            #  Serial from AdvancedPid 
-            # Format: "XXXXX-XXX-SSSSSSS-SSSSS"
-            $pidParts = $AdvancedPid.Split('-')
-            $SerialA  = [int]$pidParts[2]
-            $SerialB  = [int]$pidParts[3]
-            $Serial   = ($SerialA * 1000000) + $SerialB
+            if ($Serial -eq -1L) {
+                #  Serial from AdvancedPid 
+                # Format: "XXXXX-XXX-SSSSSSS-SSSSS"
+                $pidParts = $AdvancedPid.Split('-')
+                $SerialA  = [int]$pidParts[2]
+                $SerialB  = [int]$pidParts[3]
+                $Serial   = ($SerialA * 1000000) + $SerialB
+            }
 
             #  PID String 
             $pidString = [Marshal]::PtrToStringUni($PIDPtr, 0x30 / 2)
@@ -8310,6 +8349,7 @@ public static class PatchFinder
                     ActivationId = $ActivationId
                     AdvancedPid  = $AdvancedPid
                     Description  = $ProductDescription
+                    ActData      = $ActData
                 })
             } else {
                 return @(
@@ -8323,6 +8363,7 @@ public static class PatchFinder
                     @{ Property = "ActivationId"; Value = $ActivationId }
                     @{ Property = "AdvancedPid";  Value = $AdvancedPid }
                     @{ Property = "Description";  Value = $ProductDescription }
+                    @{ Property = "ActData";      Value = $ActData }
                 )
             }
 
