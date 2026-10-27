@@ -8177,6 +8177,9 @@ public static class PatchFinder
         $DPIDPtr  = New-IntPtr -Size 0xB0  -InitialValue 0xA4
         $DPID4Ptr = New-IntPtr -Size 0x500 -InitialValue 0x4F8
 
+        # FIX 1: track whether we actually applied the patch this call
+        $patched = $false
+
         if ($OutSec) {
             try {
                 
@@ -8196,6 +8199,7 @@ public static class PatchFinder
                 # Apply in-memory patch: movups displacement 0x58 -> 0x48
                 # Redirects source from RawKeyMaterial to Security field
                 [MemPatch]::Apply($PidDll, $patchRVA, 0x48) | Out-Null
+                $patched = $true
 
               # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Patch ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ .!
 
@@ -8220,22 +8224,6 @@ public static class PatchFinder
                 )
 
             } catch {
-                
-				<#
-                >>> .InnerException Class <<<
-                -----------------------------
-
-                ErrorCode      : -1979645951
-                Message        : Exception from HRESULT: 0x8A010001
-                Data           : {}
-                InnerException : 
-                TargetSite     : Int32 PidGenX(System.String, System.String, System.String, Int32, IntPtr, IntPtr, IntPtr)
-                StackTrace     :    at 0.PidGenX(String , String , String , Int32 , IntPtr , IntPtr , IntPtr )
-								                at CallSite.Target(Closure , CallSite , Object , String , String , String , Int32 , IntPtr , IntPtr , Object )
-                HelpLink       : 
-                Source         : 4
-                HResult        : -1979645951
-                #>
 
                 $innerException = $_.Exception.InnerException
                 $HResult   = $innerException.HResult
@@ -8275,7 +8263,7 @@ public static class PatchFinder
             $Security = -1L
             if ($OutSec) {
               #  DPID4 Binary Fields 
-              # +0x328: Security” dynamically patched movups displacement
+              # +0x328: Security dynamically patched movups displacement
               $Security = [Marshal]::ReadInt64([IntPtr]::Add($DPID4Ptr, 0x328))
             }
 
@@ -8343,8 +8331,10 @@ public static class PatchFinder
             [Marshal]::FreeHGlobal($DPIDPtr)
             [Marshal]::FreeHGlobal($DPID4Ptr)
 
-            # Revert in-memory patch
-            [MemPatch]::Apply($PidDll, $patchRVA, 0x58) | Out-Null
+            # FIX 2: only revert if we actually patched this call
+            if ($patched) {
+                [MemPatch]::Apply($PidDll, $patchRVA, 0x58) | Out-Null
+            }
         }
     } catch {
         if ($AsObject) {
