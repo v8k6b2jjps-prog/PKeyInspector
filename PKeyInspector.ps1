@@ -13673,9 +13673,9 @@ public static class PatchFinder
                         ([Guid]'660672EF-7809-4CFD-8D54-41B7FB738988') { $algo2009=$true; $AlgoName = 'pkey2009' }
 
                         # legacy -> NO union, NO Security: Group/Serial/Upgrade from the standard fields
-                        ([Guid]'35BFEDB3-9131-4F58-9D9A-5B32D10F50E0') { $legacy=$true; $AlgoName   = 'pkey980'  }
-                        ([Guid]'9F44BF99-4976-4BFD-B00A-A8AEFBA45484') { $legacy=$true; $AlgoName   = 'pkey985'  }
-                        ([Guid]'2B864AA3-A736-4D50-8604-EBB3BD7D7C61') { $legacy=$true; $AlgoName   = 'pkey986'  }
+                        ([Guid]'35BFEDB3-9131-4F58-9D9A-5B32D10F50E0') { $legacy=$true;   $AlgoName  = 'pkey980' }
+                        ([Guid]'9F44BF99-4976-4BFD-B00A-A8AEFBA45484') { $legacy=$true;   $AlgoName  = 'pkey985' }
+                        ([Guid]'2B864AA3-A736-4D50-8604-EBB3BD7D7C61') { $legacy=$true;   $AlgoName  = 'pkey986' }
                         # unknown GUID -> keep the N-heuristic
                     }
                 }
@@ -13722,15 +13722,20 @@ public static class PatchFinder
                     # So, Not N key, Have M ? Or Not ..
                     $M = [BitConverter]::ToInt64($slot, 0)                       # low 8 bytes = M
                     if ($M -ne 0) {
+                        
                         $ActData = [BitConverter]::ToString($slot, 0, 8)         # M occupies up to 8 bytes
                         $upgrade  =  [int]($M -band 1)
                         $serial   = ($M -shr 1 ) -band 0x3FFFFFFF                # 30b
                         $security = ($M -shr 31) -band 0xFFFFF                   # 20b
                         $AlgoName = 'pkey2005'
                         $AlgoGuid = [Guid]'B8731595-A2F6-430B-A799-FBFFB81A8D73'
+
                     } else {
                         $AlgoName = 'Legacy'
                         $AlgoGuid = [Guid]::Empty
+                        $upgrade  = [int][Marshal]::ReadByte([IntPtr]::Add($DPID4Ptr, 0x320))  # m_isUpgrade (native)
+                        $Security = $null     # legacy has none
+                        $ActData  = ''
                     }
                 }
             }
@@ -16956,27 +16961,33 @@ function Retrieve-SKUInfo {
     }
 }
 function Retrieve-TokenSKUInfo {
+    [CmdletBinding(DefaultParameterSetName='BySku')]
     param (
-        [Parameter(Mandatory=$true, Position=0)]
+        [Parameter(Mandatory=$true, Position=0, ParameterSetName='BySku')]
         [Guid]$SkuId,
 
-        [Parameter(Mandatory=$false)]
-        [ValidateSet("Table", "MetaData")]
+        [Parameter(Mandatory=$false, ParameterSetName='BySku')]
+        [ValidateSet("Table", "MetaData", "FileInfo")]
         [string]$Mode = "Table",
 
+        [Parameter(Mandatory=$true, ParameterSetName='Dump')]
+        [switch]$Dump,
+
+        # no ParameterSetName => belongs to ALL sets (shared)
         [LibTSforge.TokenStore.TokenStoreModern]$Store,
         [switch]$KeepAlive
     )
 
     $SPP = @{
         Pub = "msft:sl/EUL/GENERIC/PUBLIC"; Priv = "msft:sl/EUL/GENERIC/PRIVATE"
-        Met = "_--_met"; App = "applicationId"; Pk = "pkeyId"; Fil = "fileId"
+        Met = "_--_met"; Fle = "_--"                      # Fle = file/content record suffix
+        App = "applicationId"; Pk = "pkeyId"; Fil = "fileId"
     }
 
     $tsPath = [LibTSforge.SPP.SPPUtils]::GetTokensPath(
         [LibTSforge.Utils]::DetectVersion())
     $tsTmp  = [IO.Path]::GetTempFileName()
-    
+
     try {
         if (-not $Store) {
             [File]::Copy($tsPath, $tsTmp, $true)
@@ -16984,7 +16995,59 @@ function Retrieve-TokenSKUInfo {
         }
         if (-not $Store) { throw "Store Init Failed" }
 
-        $GetMeta = { param($id) if($id){ try {[LibTSforge.TokenStore.TokenMeta]::new($Store.GetEntry("$($id)$($SPP.Met)", 'xml').Data).Data} catch {} } }
+    if ($Dump.IsPresent) {
+        $bf = [Reflection.BindingFlags]'Instance,NonPublic,Public'
+        $pget = { param($o,$n) $f=$o.GetType().GetField($n,$bf); if($f){$f.GetValue($o)} }
+
+        $entries = & $pget $Store 'Entries'
+        if (-not $entries) { return $null }
+
+        return $entries | ForEach-Object {
+            $name = & $pget $_ 'Name'            # <-- was "$_"  (TokenEntry has no ToString)
+            $ext  = & $pget $_ 'Extension'
+            $kind = switch -regex ($name) {
+                        '_--_met$' { 'meta' }
+                        '_--$'     { 'blob' }
+                        default    { 'other' }
+                    }
+            $id   = if ($name -match '^([0-9a-fA-F-]{36})') { $Matches[1] }
+
+            $data = $null
+            try { $data = $Store.GetEntry($name, $ext).Data } catch {}
+            $parsed = if ($data) {
+                switch ($ext) {
+                    'xml' {
+                        # TokenMeta property blob (meta OR pointer)
+                        try   { [LibTSforge.TokenStore.TokenMeta]::new($data).Data }
+                        catch { try { [Text.Encoding]::UTF8.GetString($data) } catch {} }
+                    }
+                    'dat' {
+                        # raw content (XrML / binary)
+                        try { [Text.Encoding]::UTF8.GetString($data) } catch { $data }
+                    }
+                    default { $data }
+                }
+            }
+
+            [PSCustomObject]@{
+                Id        = $id
+                Kind      = $kind
+                Extension = $ext
+                Name      = $name
+                Bytes     = $(if ($data) { $data.Length })
+                Data      = $data
+                Parsed    = $parsed
+            }
+        }
+    }
+
+        # $suffix defaults to metadata (_--_met); pass "_--" for the file record
+        $GetMeta = { param($id, $suffix = '_--_met')
+            if ($id) { try {
+                [LibTSforge.TokenStore.TokenMeta]::new(
+                    $Store.GetEntry("$($id)$($suffix)", 'xml').Data).Data
+            } catch {} }
+        }
 
         $SkuData = &$GetMeta $SkuId
         $Pub     = &$GetMeta $(if($SkuData){ $SkuData[$SPP.Pub] })
@@ -17000,7 +17063,7 @@ function Retrieve-TokenSKUInfo {
                 ID_LICENSE      = @($SkuData[$SPP.Pub], $SkuData[$SPP.Priv])
                 ID_LICENSE_FILE = $Pub[$SPP.Fil]
             }
-        } 
+        }
         elseif ($Mode -eq "MetaData") {
 
             # Mode 2: Extended Info (Internal Metadata)
@@ -17040,6 +17103,35 @@ function Retrieve-TokenSKUInfo {
                 licensorUrl                = $Pub["licensorUrl"]
                 ValidationURL              = $Pub["ValUrl"]
                 UseLicenseURL              = $Pub["PAUrl"]
+            }
+        }
+        elseif ($Mode -eq "FileInfo") {
+
+            # Mode 3: Physical license-file info (from the <fileId>_-- record)
+            $fileId  = if ($Pub) { $Pub[$SPP.Fil] }
+            $FileRec = &$GetMeta $fileId $SPP.Fle              # <fileId>_--  (xml)
+
+            $licName = $FileRec['windowsComponentLicenseFileName']
+            $licPath = if ($licName) { [Environment]::ExpandEnvironmentVariables($licName) }
+            $licTime = if ($FileRec['windowsComponentLicenseFileTimestamp']) {
+                try { [DateTime]::FromFileTimeUtc([BitConverter]::ToInt64(
+                    [Convert]::FromBase64String($FileRec['windowsComponentLicenseFileTimestamp']),0)) } catch {}
+            }
+            $storage = if     ($licName) { 'OnDisk' }          # in-box: points to .xrm-ms
+                       elseif ($FileRec) { 'InStore' }         # acquired: blob inside data.dat
+                       else              { $null }
+
+            return [PSCustomObject]@{
+                ID_SKU               = $SkuId.ToString()
+                fileId               = $fileId
+                metaInfoType         = $FileRec['metaInfoType']        # metaInfoTypeFile / …
+                LicenseStorage       = $storage
+                LicenseFileName      = $licName
+                LicenseFilePath      = $licPath
+                LicenseFileExists    = [bool]($licPath -and (Test-Path $licPath))
+                LicenseFileSize      = $FileRec['windowsComponentLicenseFileSize']
+                LicenseFileTimestamp = $licTime
+                LicenseFileHashId    = $FileRec['hashIdString']
             }
         }
     }
