@@ -13676,6 +13676,7 @@ public static class PatchFinder
                         ([Guid]'35BFEDB3-9131-4F58-9D9A-5B32D10F50E0') { $legacy=$true;   $AlgoName  = 'pkey980' }
                         ([Guid]'9F44BF99-4976-4BFD-B00A-A8AEFBA45484') { $legacy=$true;   $AlgoName  = 'pkey985' }
                         ([Guid]'2B864AA3-A736-4D50-8604-EBB3BD7D7C61') { $legacy=$true;   $AlgoName  = 'pkey986' }
+                        
                         # unknown GUID -> keep the N-heuristic
                     }
                 }
@@ -13696,46 +13697,54 @@ public static class PatchFinder
                     $u = [byte[]]::new(14)
                     [Array]::Copy($slot, 0, $u, 0, 13)                           # 13 data bytes + 1 zero => unsigned
                     $act = [System.Numerics.BigInteger]::new($u)
-                    $ActData = [BitConverter]::ToString($slot, 0, 13)            # ActData is 13 bytes
                     $upgrade  =  [int]($act -band 1)
                     $serial   = [long](($act -shr 1 ) -band ((1L -shl 30)-1))    # 30b
                     $group    = [long](($act -shr 31) -band ((1L -shl 20)-1))    # 20b
                     $security = [long](($act -shr 51) -band ((1L -shl 53)-1))    # 53b
+                    $ActData = [BitConverter]::ToString($slot, 0, 13)
 
                 } elseif ($algo2005) {
 
                     # Pkey2005 Format : M = upgrade | serial<<1 | security<<31  (51 bits)
                     $M = [BitConverter]::ToInt64($slot, 0)                       # low 8 bytes = M
-                    $ActData = [BitConverter]::ToString($slot, 0, 8)             # M occupies up to 8 bytes
                     $upgrade  =  [int]($M -band 1)
                     $serial   = ($M -shr 1 ) -band 0x3FFFFFFF                    # 30b
                     $security = ($M -shr 31) -band 0xFFFFF                       # 20b
+                    $ActData = [BitConverter]::ToString($slot, 0, 12)            # 6 Bytes + 6 Dummy Bytes
 
                 } elseif($legacy) {
 
-                    $upgrade  = [int][Marshal]::ReadByte([IntPtr]::Add($DPID4Ptr, 0x320))  # m_isUpgrade (native)
-                    $Security = $null     # legacy has none
-                    $ActData  = ''
+                    $M = [BitConverter]::ToInt64($slot, 0)
+                    $Upgrade = [int]($M -band 1)
+                    $Serial  = ($M -shr 1) -band 0x3FFFFFFF
+                    $Security = $null
+                    $ActData = [BitConverter]::ToString($slot, 0, 12)            # 4 Bytes + 8 Dummy Bytes
 
                 } else {
+
+                    $M = [BitConverter]::ToInt64($slot, 0)
+                    $Upgrade = [int]($M -band 1)             # IsUpgrade
+                    $Serial  = ($M -shr 1)  -band 0x3FFFFFFF # Serial
+                    $val1    = ($M -shr 31) -band 0xFFFFF    # Security [2005] -or Group [2009]
                     
-                    # So, Not N key, Have M ? Or Not ..
-                    $M = [BitConverter]::ToInt64($slot, 0)                       # low 8 bytes = M
-                    if ($M -ne 0) {
-                        
-                        $ActData = [BitConverter]::ToString($slot, 0, 8)         # M occupies up to 8 bytes
-                        $upgrade  =  [int]($M -band 1)
-                        $serial   = ($M -shr 1 ) -band 0x3FFFFFFF                # 30b
-                        $security = ($M -shr 31) -band 0xFFFFF                   # 20b
+                    # Not checked, Cover by N` key Check
+                    # Not reliable, fake key With N` no security ? edge case
+                    $val2    = ($M -shr 51)                  # Security [2009]
+                    
+                    # 6 Bytes + 6 Dummy Bytes -Or 4 Bytes + 8 Dummy Bytes
+                    # Depend on algorithm [Legacy, pkey2005]
+                    $ActData = [BitConverter]::ToString($slot, 0, 12)
+
+                    if ($val1 -ne 0) {
+                        # 2005 Case, sub_18008DA70
+                        $Security = $val1
                         $AlgoName = 'pkey2005'
                         $AlgoGuid = [Guid]'B8731595-A2F6-430B-A799-FBFFB81A8D73'
-
                     } else {
+                        # 980,985,986 Case, sub_18008D4E0
+                        $security = $null
                         $AlgoName = 'Legacy'
                         $AlgoGuid = [Guid]::Empty
-                        $upgrade  = [int][Marshal]::ReadByte([IntPtr]::Add($DPID4Ptr, 0x320))  # m_isUpgrade (native)
-                        $Security = $null     # legacy has none
-                        $ActData  = ''
                     }
                 }
             }
@@ -17124,7 +17133,7 @@ function Retrieve-TokenSKUInfo {
             return [PSCustomObject]@{
                 ID_SKU               = $SkuId.ToString()
                 fileId               = $fileId
-                metaInfoType         = $FileRec['metaInfoType']        # metaInfoTypeFile / …
+                metaInfoType         = $FileRec['metaInfoType']
                 LicenseStorage       = $storage
                 LicenseFileName      = $licName
                 LicenseFilePath      = $licPath
