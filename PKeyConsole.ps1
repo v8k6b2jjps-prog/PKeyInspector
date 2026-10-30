@@ -8299,8 +8299,8 @@ public static class PatchFinder
             $Security = -1L
             $upgrade  = -1
             $ActData  = ''
-            $AlgoGuid = [Guid]::Empty
             $AlgoName = ''
+            $AlgoGuid = [Guid]::Empty
 
             if ($Extra) {
 
@@ -8347,39 +8347,35 @@ public static class PatchFinder
 
                 } elseif ($algo2005) {
 
-                    # Pkey2005 Format : M = upgrade | serial<<1 | security<<31  (51 bits)
-                    $M = [BitConverter]::ToInt64($slot, 0)                       # low 8 bytes = M
+                    # Pkey2005 Format : M = upgrade | serial<<1 | (sec & 0x3FF)<<31  (41 bits)
+                    $M = [BitConverter]::ToInt64($slot, 0)
                     $upgrade  =  [int]($M -band 1)
-                    $serial   = ($M -shr 1 ) -band 0x3FFFFFFF                    # 30b
-                    $security = ($M -shr 31) -band 0xFFFFF                       # 20b
-                    $ActData = [BitConverter]::ToString($slot, 0, 12)            # 6 Bytes + 6 Dummy Bytes
+                    $serial   = ($M -shr 1 ) -band 0x3FFFFFFF                    # 30 b
+                    $security = ($M -shr 31) -band 0x3FF                         # 10 b
+                    $ActData  = [BitConverter]::ToString($slot, 0, 12)           # 6 real + 6 pad
 
                 } elseif($legacy) {
 
                     $M = [BitConverter]::ToInt64($slot, 0)
-                    $upgrade = [int]($M -band 1)
-                    $serial  = ($M -shr 1) -band 0x3FFFFFFF
+                    $Upgrade = [int]($M -band 1)
+                    $Serial  = ($M -shr 1) -band 0x3FFFFFFF
                     $Security = $null
                     $ActData = [BitConverter]::ToString($slot, 0, 12)            # 4 Bytes + 8 Dummy Bytes
 
                 } else {
 
                     $M = [BitConverter]::ToInt64($slot, 0)
-                    $upgrade = [int]($M -band 1)             # IsUpgrade
-                    $serial  = ($M -shr 1)  -band 0x3FFFFFFF # Serial
-                    $val1    = ($M -shr 31) -band 0xFFFFF    # Security [2005] -or Group [2009]
-                    
-                    # Not checked, Cover by N` key Check
-                    # Not reliable, fake key With N` no security ? edge case
-                    $val2    = ($M -shr 51)                  # Security [2009]
+                    $Upgrade = [int]($M -band 1)             # IsUpgrade
+                    $Serial  = ($M -shr 1)  -band 0x3FFFFFFF # Serial
+                    $SecVal  = ($M -shr 31) -band 0x3FF      # 2005 Security (10b);
                     
                     # 6 Bytes + 6 Dummy Bytes -Or 4 Bytes + 8 Dummy Bytes
                     # Depend on algorithm [Legacy, pkey2005]
                     $ActData = [BitConverter]::ToString($slot, 0, 12)
 
-                    if ($val1 -ne 0) {
+                    if ($SecVal -ne 0) {
                         # 2005 Case, sub_18008DA70
-                        $Security = $val1
+                        $Security = $SecVal
                         $AlgoName = 'pkey2005'
                         $AlgoGuid = [Guid]'B8731595-A2F6-430B-A799-FBFFB81A8D73'
                     } else {
