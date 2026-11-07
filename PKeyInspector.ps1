@@ -15817,83 +15817,93 @@ function Get-ContentIdInfo {
 }
 function Export-LicenseTable {
     param (
-        [ValidateSet("pkeyhelper.dll", "LicensingWinRT.dll")]
-        $DllPath,
+        [ValidateSet("pkeyhelper.dll")]
+        [string]$DllPath = 'pkeyhelper.dll',
 
         [switch]$Expend
     )
-            
-    $Table        = @()
-    $marker       = 0x0
-    $pfnPattern   = "Microsoft.Windows*"
-    $guidPattern  = "^[a-f0-9\-]{36}$"
-    $cdKeyPattern = "^[A-Z0-9]{5}-"
 
-    $RawStrings = Get-Strings -Path "$env:windir\system32\$DllPath" -MinimumLength 29
+    $hMod = Ldr-LoadDll -dwFlags SEARCH_SYS32 -dll $DllPath
+    $Ptr = [IntPtr]::Zero
+    $Export = Init-NativeString 'GetDefaultProductKeyForPfn' -Encoding Ansi
+    $Global:ntdll::LdrGetProcedureAddressForCaller($hMod, $Export, 0, [ref]$Ptr, 0, 0) | Out-Null
+    Free-NativeString -StringPtr $Export
+
+    $Buf = New-Object Byte[] 200
+    [Marshal]::Copy($Ptr, $Buf, 0, 200)
+
+    $TableAddr  = [IntPtr]::Zero
+    $EntryCount = 0
+
+    for ($p = 0; $p -lt 180; $p++) {
+        if (($Buf[$p] -eq 0x48 -or $Buf[$p] -eq 0x4C) -and $Buf[$p+1] -eq 0x8D -and
+            ($Buf[$p+2] -band 0xC7) -eq 0x05) {
+            $disp = [BitConverter]::ToInt32($Buf, $p + 3)
+            $TableAddr = [IntPtr]($Ptr.ToInt64() + $p + 7 + $disp)
+        }
+        if ($Buf[$p] -eq 0x81 -and ($Buf[$p+1] -band 0xF8) -eq 0xF8) {
+            $val = [BitConverter]::ToInt32($Buf, $p + 2)
+            if ($val -gt 100 -and $val -lt 10000) { $EntryCount = $val }
+        }
+        if ($TableAddr -ne [IntPtr]::Zero -and $EntryCount -gt 0) { break }
+    }
+
+    if ($TableAddr -eq [IntPtr]::Zero -or $EntryCount -eq 0) {
+        throw "Could not locate pointer table in $DllPath"
+    }
+
+    $PtrSize = [IntPtr]::Size
+    $Stride  = $PtrSize * 3
 
     $DbLookup = @{}
     if ($Global:PKeyDatabase) {
         foreach ($item in $Global:PKeyDatabase) { $DbLookup[$item.RefGroupId] = $item }
     }
 
-    for ($i = 0; $i -lt $RawStrings.Count - 3; $i++) {
-        if ($RawStrings[$i] -like $pfnPattern) {
-            if ($RawStrings[$i+1] -match $guidPattern) {
-                
-                $keyFlag = $false
-                if ($marker -le 0x0) { $marker = 0x01 }
-                
-                if ($RawStrings[$i+2] -match $cdKeyPattern) {
-                    $ProductKey = $RawStrings[$i+2]
-                } else {
-                    $ProductKey = 'N\A'
-                    $keyFlag = $true
-                }
+    $Table = [System.Collections.Generic.List[PSObject]]::new($EntryCount)
 
-                $parts = $RawStrings[$i] -split '\.|_'
-                $ShortPfn = if ($parts.Count -ge 4) { "$($parts[2]).$($parts[3])" } else { $RawStrings[$i] }
+    for ($i = 0; $i -lt $EntryCount; $i++) {
+        $base = $TableAddr.ToInt64() + $i * $Stride
+        $pPfn = [Marshal]::ReadIntPtr([IntPtr]$base)
+        $pCid = [Marshal]::ReadIntPtr([IntPtr]($base + $PtrSize))
+        $pKey = [Marshal]::ReadIntPtr([IntPtr]($base + $PtrSize * 2))
 
-                $licenseObj = [PSCustomObject]@{
-                    EditionPfn = $ShortPfn #$RawStrings[$i]
-                    ContentID  = $RawStrings[$i+1]
-                    ProductKey = $ProductKey
-                }
+        $Pfn = [Marshal]::PtrToStringUni($pPfn)
+        $Cid = [Marshal]::PtrToStringUni($pCid)
+        $Key = if ($pKey -ne [IntPtr]::Zero) {
+            [Marshal]::PtrToStringUni($pKey)
+        } else { 'N\A' }
 
-                if ($Expend.IsPresent -and $ProductKey -ne 'N\A') {
-                    try {
-                        $decoded = Decode-Key -Key $ProductKey
-                        $RefGroupId = $decoded.Group            
-                        
-                        if ($RefGroupId -and $DbLookup.ContainsKey("$RefGroupId")) {
-                            $Match = $DbLookup["$RefGroupId"]
-                            $RawSkuID = $Match.ActConfigId
+        $parts = $Pfn -split '\.|_'
+        $Short = if ($parts.Count -ge 4) { "$($parts[2]).$($parts[3])" } else { $Pfn }
 
-                            $licenseObj = [PSCustomObject]@{
-                                Group      = $RefGroupId
-                                EditionPfn = $ShortPfn
-                                ProductKey = $ProductKey
-                                SkuID      = if ($RawSkuID) { $RawSkuID.Substring(1, 36) } else { "N/A" }
-                                ContentID  = $RawStrings[$i+1]
-                            }
-                        }
-                    } catch { }
-                }
-
-                $Table += $licenseObj
-                
-                $i += if ($keyFlag) { 1 } else { 2 }
-                continue
-            }
+        $licenseObj = [PSCustomObject]@{
+            EditionPfn = $Short
+            ContentID  = $Cid
+            ProductKey = $Key
         }
 
-        if ($marker -gt 0x0) {
-            if (1 -eq ($i - $marker)) { 
-                break 
-            }
-            $marker = $i
+        if ($Expend.IsPresent -and $Key -ne 'N\A') {
+            try {
+                $decoded = Decode-Key -Key $Key
+                $RefGroupId = $decoded.Group
+                if ($RefGroupId -and $DbLookup.ContainsKey("$RefGroupId")) {
+                    $Match = $DbLookup["$RefGroupId"]
+                    $RawSkuID = $Match.ActConfigId
+                    $licenseObj = [PSCustomObject]@{
+                        Group      = $RefGroupId
+                        EditionPfn = $Short
+                        ProductKey = $Key
+                        SkuID      = if ($RawSkuID) { $RawSkuID.Substring(1, 36) } else { "N/A" }
+                        ContentID  = $Cid
+                    }
+                }
+            } catch { }
         }
+
+        $Table.Add($licenseObj)
     }
-    
+
     return $Table
 }
 #endregion
